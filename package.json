@@ -1,0 +1,62 @@
+{
+  "name": "flux-reader",
+  "version": "0.2.0",
+  "description": "Cross-platform RSS reader — Electron + optional self-hosted web server",
+  "main": "src/main/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm:dev:server\" \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "vite --host",
+    "dev:electron": "wait-on http://localhost:5173 && electron --trace-warnings .",
+    "dev:server": "node server/index.js",
+    "build": "vite build",
+    "start": "NODE_ENV=production electron --trace-warnings .",
+    "postinstall": "node scripts/check-electron.js"
+  },
+  "build": {
+    "appId": "com.flux.reader",
+    "productName": "Flux",
+    "files": [
+      "dist/**/*",
+      "src/main/**/*",
+      "src/preload/**/*",
+      "src/core/**/*",
+      "server/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "icon": "assets/icon.icns"
+    },
+    "linux": {
+      "icon": "assets/icon.png"
+    }
+  },
+  "overrides": {
+    "electron": "42.4.1"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "bcryptjs": "^2.4.3",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "dompurify": "^3.1.6",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^7.1.0",
+    "jsdom": "^25.0.0",
+    "multer": "^2.0.0",
+    "node-fetch": "^3.3.2",
+    "otplib": "^12.0.1",
+    "rss-parser": "^3.13.0",
+    "tough-cookie": "^5.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "42.4.1",
+    "electron-builder": "^26.15.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.3"
+  }
+}
