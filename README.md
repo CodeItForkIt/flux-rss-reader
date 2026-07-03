@@ -1,12 +1,12 @@
 # Flux — RSS Reader
 
-A cross-platform RSS reader. Two ways to run it from the same codebase:
+A cross-platform RSS reader. Three ways to access it:
 
 - **Electron** (primary, Linux desktop app) — local storage, no login, full
   `<webview>`-based inline browser
 - **Self-hosted web server** (optional) — multi-user, JWT auth, per-user
   SQLite-backed data; run directly with Node, no Docker required
-- **Vercel-hosted Web App** - Access at flux-rss-reader.vercel.app and login/make an account. All the features of the above except for AI features.
+- **Vercel-hosted Web App** - Access at flux-rss-reader.vercel.app and login/make an account. All the features below except for AI features due to Vercel limitations.
 
 Features: real RSS fetching, Readability reader mode, per-feed CSS/HTML
 element blocking with a visual point-and-click picker, paywall bypass chain
@@ -33,53 +33,6 @@ so installs should be reliable on any recent Node version. A `postinstall`
 script (`scripts/check-electron.js`) automatically checks that Electron's
 binary downloaded correctly and prints a clear message if it didn't.
 
-**Don't run `npm audit fix --force` in this project.** It will report
-Electron CVEs — these are almost all about apps *built with* Electron
-exposing unsafe APIs to remote/untrusted web content (XSS in a renderer
-escalating to native code, that kind of thing). They're real concerns for,
-say, a chat app that renders arbitrary HTML from other users — not for a
-personal RSS reader you run locally against feeds you chose. `--force`
-ignores your pinned version range entirely and grabs whatever satisfies the
-audit, which is also exactly what corrupts the Electron install: it
-downloads a new version's package metadata but doesn't necessarily finish
-downloading/extracting the matching binary, leaving `node_modules/electron`
-in a broken half-state — `Electron failed to install correctly` (or
-`electron: command not found` after you delete the folder hoping a reinstall
-fixes it, which it won't without `package-lock.json` also matching the
-metadata that's now wrong). Deleting `node_modules/electron` alone doesn't
-fix it either, since the metadata pointing at the wrong version is still in
-`package-lock.json`. **The real fix once this has already happened:**
-```bash
-rm -rf node_modules package-lock.json
-npm install
-```
-Electron is pinned via both `devDependencies` and `overrides` in
-`package.json`, specifically so a stray `npm audit fix` (even without
-`--force`) can't silently swap it out from under the rest of the toolchain.
-If `npm audit` reports something in one of the actual app dependencies
-(express, jsdom, etc.) that's worth a look — those run against real
-content you don't control (RSS feeds, fetched articles) — but check what
-the advisory actually describes before reaching for `--force`.
-
-### About the `npm warn deprecated` lines
-
-`npm install` prints a few deprecation warnings for packages this project
-doesn't depend on directly — they're transitive (dependencies of
-dependencies), and traced below for anyone who wants to verify rather than
-take it on faith:
-
-| Package | Pulled in by | Why it's not a problem |
-|---|---|---|
-| `boolean` | `electron` → `@electron/get` → `global-agent` | Part of Electron's own binary-downloader, used once at install time. Never imported by app code, never shipped in the packaged app. |
-| `whatwg-encoding`, `node-domexception` | `jsdom` (article extraction) and `node-fetch` (HTTP client) respectively | Deprecated in favor of newer platform-native APIs upstream, not because of a security issue. Functionally fine; will go away on their own whenever `jsdom`/`node-fetch` release majors that drop them. |
-| `inflight`, `rimraf@2`, `glob@7` | `electron-builder` (only if you've installed it separately to build a `.dmg`/AppImage — see below) | Not part of this project's own dependency tree at all. `electron-builder` is a packaging CLI you run once locally; none of its dependencies end up bundled into the app users actually run. |
-
-None of these run inside the shipped application — they're either
-install-time tooling or article-parsing/fetch internals with no known
-vulnerabilities, just upstream-deprecated APIs. Pinning around them would
-mean forking `jsdom`, `node-fetch`, or `electron` itself, which isn't worth
-the trade for warnings that don't reflect actual risk.
-
 This runs `vite --host` (frontend, bound to `0.0.0.0:5173` so you can also
 open it from your phone on the same network for UI testing) and Electron
 (with `--trace-warnings` for easier debugging) together.
@@ -104,23 +57,6 @@ npx electron-builder --linux AppImage
 npm install --save-dev electron-builder
 npm run build
 npx electron-builder --mac dmg
-```
-
-App icons (`assets/icon.png` for Linux, `assets/icon.icns` for macOS) are
-already built and wired into `package.json`'s `build` config — no manual
-conversion step needed. Both were generated from `assets/icon.svg`, which
-is also used as the browser-tab favicon in web mode and the in-app sidebar
-logo. If you change the SVG, regenerate the others to match:
-
-```bash
-pip install cairosvg --break-system-packages
-python3 -c "
-import cairosvg
-cairosvg.svg2png(url='assets/icon.svg', write_to='assets/icon.png', output_width=512, output_height=512)
-"
-# .icns is a documented binary container (magic + length-prefixed PNG
-# chunks at standard Apple sizes) — see the generation approach used for
-# this repo if you need to regenerate it without macOS's iconutil.
 ```
 
 The packaged app loads its UI over a custom `app://` scheme rather than raw
@@ -154,7 +90,7 @@ on startup so you don't have to guess it.
 
 ### Testing the mobile/web UI
 
-`npm run dev` binds Vite to your LAN IP. Visiting `http://<your-ip>:5173`
+`npm run dev:server` binds Vite to your LAN IP. Visiting `http://<your-ip>:5173`
 from a phone browser loads the same React UI in **web mode** — no login, no
 separate account. See below for running the API server it talks to.
 
