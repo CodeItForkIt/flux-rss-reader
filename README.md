@@ -6,7 +6,7 @@ A cross-platform RSS reader. Two ways to run it from the same codebase:
   `<webview>`-based inline browser
 - **Self-hosted web server** (optional) — multi-user, JWT auth, per-user
   SQLite-backed data; run directly with Node, no Docker required
-
+- **Vercel-hosted Web App** - Access at flux-rss-reader.vercel.app and login/make an account. All the features of the above except for AI features.
 Features: real RSS fetching, Readability reader mode, per-feed CSS/HTML
 element blocking with a visual point-and-click picker, paywall bypass chain
 (cookies → 12ft.io → archive.ph), inline browser for feeds that truncate
