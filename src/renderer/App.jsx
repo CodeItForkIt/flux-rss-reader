@@ -561,6 +561,24 @@ function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedI
     onSelect(item);
   };
 
+  useEffect(() => {
+    const el = listScrollRef.current;
+    if (!el) return;
+    const handler = (e) => {
+      const a = e.target.closest?.('a');
+      if (!a || !a.href) return;
+      e.preventDefault();
+      e.stopPropagation();
+      api.openExternal(a.href);
+    };
+    el.addEventListener('click', handler);
+    el.addEventListener('auxclick', handler);
+    return () => {
+      el.removeEventListener('click', handler);
+      el.removeEventListener('auxclick', handler);
+    };
+  }, []);
+
   if (collapsed) {
     // Collapsed rail — just a thin strip showing the label and expand button
     return <div style={{ width:40, minWidth:40, background:T.surface, borderRight:`1px solid ${T.border}`, display:'flex', flexDirection:'column', alignItems:'center', padding:'10px 0', gap:8, overflow:'hidden', transition:'width 0.2s ease' }}>
@@ -847,6 +865,19 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
     else if (iframeRef.current) iframeRef.current.src = iframeRef.current.src;
   };
 
+  const handleCopyCurrentUrl = useCallback(async () => {
+    if (!current || current === 'about:blank') return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(current);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = current; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      }
+    } catch {}
+  }, [current]);
+
   // Web-mode iframe: detect in-page navigation where possible (same-origin
   // only — cross-origin loads can't be introspected, so back/forward there
   // just replays our own history stack).
@@ -874,12 +905,9 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
         <IconBtn icon="→" title="Forward" onClick={()=>navigate(1)} disabled={forwardDisabled} size={isMobile?36:28} />
         <IconBtn icon="↺" title="Reload" onClick={reload} size={isMobile?36:28} />
         {loading && <Spinner size={13} />}
-        {!isMobile && (
-          <div style={{ flex:1, background:T.surfaceActive, borderRadius:6, padding:'5px 10px', fontSize:12, color:T.textMuted, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-            {title ? `${title} — ${current}` : current}
-          </div>
-        )}
-        {isMobile && <div style={{ flex:1 }} />}
+        <div style={{ flex:1 }} />
+        {!isMobile && <><Divider vertical margin={4} /><IconBtn icon="⧉" title="Copy current URL" onClick={handleCopyCurrentUrl} size={isMobile?36:28} /></>}
+        <Divider vertical margin={4} />
         <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(current)} size={isMobile?36:28} />
         {!isMobile && <><Divider vertical margin={4} /><Btn small variant="outline" onClick={onClose}>✕ Close</Btn></>}
         {isMobile && <IconBtn icon="✕" title="Close" onClick={onClose} size={36} />}
@@ -1108,17 +1136,10 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     const handler=(e)=>{
       const a=e.target.closest('a');
       if (!a||!a.href) return;
-      if (a.href.startsWith(window.location.origin)) return;
+      const href = a.getAttribute('href') || '';
+      if (!href || href.startsWith('#')) return;
       e.preventDefault();
-      const forceInline = e.metaKey || e.ctrlKey || e.button===1;
-      const useInline = feed?.inlineBrowser || forceInline;
-      if (useInline) {
-        setBrowStack(s=>[...s,browUrl||article?.link]);
-        setBrowUrl(a.href);
-        setInlineBrow(true);
-      } else {
-        api.openExternal(a.href);
-      }
+      api.openExternal(a.href);
     };
     el.addEventListener('click',handler);
     el.addEventListener('auxclick',handler);
