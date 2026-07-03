@@ -192,6 +192,54 @@ function proxyBypassAllowed(req) {
   return secFetchDest === 'iframe' || secFetchMode === 'navigate' || sameOriginReferer || sameOriginOrigin;
 }
 
+function buildProxyForwardHeaders(req) {
+  const forwarded = {
+    'user-agent': req.headers['user-agent'],
+    accept: req.headers.accept,
+    'accept-language': req.headers['accept-language'],
+    referer: req.headers.referer,
+    origin: req.headers.origin,
+    'sec-fetch-site': req.headers['sec-fetch-site'],
+    'sec-fetch-mode': req.headers['sec-fetch-mode'],
+    'sec-fetch-dest': req.headers['sec-fetch-dest'],
+    'sec-ch-ua': req.headers['sec-ch-ua'],
+    'sec-ch-ua-mobile': req.headers['sec-ch-ua-mobile'],
+    'sec-ch-ua-platform': req.headers['sec-ch-ua-platform'],
+  };
+  const headers = {};
+  for (const [key, value] of Object.entries(forwarded)) {
+    if (Array.isArray(value)) {
+      if (value.length) headers[key] = value[0];
+    } else if (typeof value === 'string' && value.trim()) {
+      headers[key] = value;
+    }
+  }
+  return headers;
+}
+
+function looksLikeBotChallenge(html) {
+  const text = String(html || '').toLowerCase();
+  const markers = [
+    'recaptcha',
+    'captcha',
+    'verify you are human',
+    'verify you are a human',
+    'check your browser',
+    'suspicious traffic',
+    'cloudflare',
+    'turnstile',
+    'access denied',
+    'this request was blocked',
+    'please wait a moment',
+  ];
+  return markers.some(marker => text.includes(marker));
+}
+
+function renderProxyFallbackHtml(targetUrl) {
+  const safeTarget = String(targetUrl || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Open this page in your browser</title><style>body{font-family:Inter,system-ui,sans-serif;background:#0e0e12;color:#e6e6f0;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px} .card{max-width:520px;background:#16161c;border:1px solid #28283a;border-radius:12px;padding:24px;line-height:1.6} a{color:#7c6af7;text-decoration:none} a:hover{text-decoration:underline}</style></head><body><div class="card"><h1 style="margin:0 0 8px;font-size:20px">This site blocked the inline view</h1><p style="margin:0 0 12px">Flux could not render this page inside the embedded browser because the site challenged the request as automated traffic. Opening the original page in a new browser tab is the most reliable option.</p><p><a href="${safeTarget}" target="_blank" rel="noopener noreferrer">Open the original page ↗</a></p></div><script>window.open(${JSON.stringify(targetUrl)}, '_blank', 'noopener,noreferrer');</script></body></html>`;
+}
+
 // A request originating from localhost or the same private network isn't
 // subject to the internet-facing brute-force/abuse concerns rate limiting
 // exists for — the operator running curl against their own box, or another
@@ -618,10 +666,18 @@ app.get('/api/proxy', async (req, res) => {
   const ssrfError = await checkSsrfSafe(parsed.hostname);
   if (ssrfError) return res.status(400).send(ssrfError);
   try {
-    const upstream = await fetchWithCookies(target, {}, cookieJars);
+    const upstream = await fetchWithCookies(target, { headers: buildProxyForwardHeaders(req) }, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
+    if (!upstream.ok && [403, 429, 503].includes(upstream.status)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(renderProxyFallbackHtml(parsed.href));
+    }
     if (ct.includes('text/html')) {
       let html = await upstream.text();
+      if (looksLikeBotChallenge(html)) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.send(renderProxyFallbackHtml(parsed.href));
+      }
       const base = `${parsed.protocol}//${parsed.host}`;
       html = html
         // Root-relative: href="/x" → href="https://site.com/x"
