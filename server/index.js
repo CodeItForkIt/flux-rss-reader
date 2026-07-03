@@ -33,6 +33,7 @@ const helmet   = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { spawn } = require('child_process');
 const { createStore } = require('./store-factory');
+const { getSessionToken, setSessionCookie, clearSessionCookie } = require('./auth-utils');
 
 const {
   loadDeps, fetchArticle, fetchFeed, fetchWithCookies,
@@ -161,8 +162,7 @@ async function checkSsrfSafe(hostname) {
 const TOKEN_HEADER = 'authorization';
 function newToken() { return crypto.randomBytes(32).toString('hex'); }
 async function requireAuth(req, res, next) {
-  const header = req.headers[TOKEN_HEADER] || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = getSessionToken(req);
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const session = await db.findSession(token);
@@ -246,6 +246,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   const user = await db.createUser(username.trim(), hash, isFirstUser, email ? email.trim() : null);
   const token = newToken();
   await db.createSession(user.id, token, req.body?.deviceLabel || null);
+  setSessionCookie(res, token);
   res.json({ token, username: user.username, isAdmin: user.isAdmin });
 });
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -267,11 +268,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
   const token = newToken();
   await db.createSession(user.id, token, req.body?.deviceLabel || null);
+  setSessionCookie(res, token);
   res.json({ token, username: user.username, isAdmin: !!user.isAdmin });
 });
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
-  const header = req.headers[TOKEN_HEADER] || '';
-  await db.deleteSession(header.slice(7));
+  const token = getSessionToken(req);
+  if (token) await db.deleteSession(token);
+  clearSessionCookie(res);
   res.json({ ok: true });
 });
 app.get('/api/auth/me', requireAuth, async (req, res) => {
