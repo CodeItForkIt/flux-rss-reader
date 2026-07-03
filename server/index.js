@@ -240,6 +240,16 @@ function renderProxyFallbackHtml(targetUrl) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Open this page in your browser</title><style>body{font-family:Inter,system-ui,sans-serif;background:#0e0e12;color:#e6e6f0;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px} .card{max-width:520px;background:#16161c;border:1px solid #28283a;border-radius:12px;padding:24px;line-height:1.6} a{color:#7c6af7;text-decoration:none} a:hover{text-decoration:underline}</style></head><body><div class="card"><h1 style="margin:0 0 8px;font-size:20px">This site blocked the inline view</h1><p style="margin:0 0 12px">Flux could not render this page inside the embedded browser because the site challenged the request as automated traffic. Opening the original page in a new browser tab is the most reliable option.</p><p><a href="${safeTarget}" target="_blank" rel="noopener noreferrer">Open the original page ↗</a></p></div><script>window.open(${JSON.stringify(targetUrl)}, '_blank', 'noopener,noreferrer');</script></body></html>`;
 }
 
+async function tryReaderProxy(target, req) {
+  const readerUrl = `https://r.jina.ai/http://${target.replace(/^https?:\/\//i, '')}`;
+  const upstream = await fetchWithCookies(readerUrl, { headers: buildProxyForwardHeaders(req) }, cookieJars);
+  if (!upstream.ok) return null;
+  const ct = upstream.headers.get('content-type') || '';
+  if (!ct.includes('text/html')) return null;
+  const html = await upstream.text();
+  return html && html.length > 500 ? { html, contentType: ct } : null;
+}
+
 // A request originating from localhost or the same private network isn't
 // subject to the internet-facing brute-force/abuse concerns rate limiting
 // exists for — the operator running curl against their own box, or another
@@ -669,12 +679,66 @@ app.get('/api/proxy', async (req, res) => {
     const upstream = await fetchWithCookies(target, { headers: buildProxyForwardHeaders(req) }, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
     if (!upstream.ok && [403, 429, 503].includes(upstream.status)) {
+      const readerFallback = await tryReaderProxy(target, req);
+      if (readerFallback) {
+        let html = readerFallback.html;
+        const base = `${parsed.protocol}//${parsed.host}`;
+        html = html
+          .replace(/(href|src|action)=("|')\/(?!\/)/g, `$1=$2${base}/`)
+          .replace(/(href|src|action)=("|')\/\//g, `$1=$2${parsed.protocol}//`)
+          .replace(/srcset=("|')([^"']+)("|')/gi, (m, q1, list, q2) => {
+            const rewritten = list.split(',').map(part => {
+              const seg = part.trim().split(/\s+/);
+              if (seg[0].startsWith('/') && !seg[0].startsWith('//')) seg[0] = base + seg[0];
+              else if (seg[0].startsWith('//')) seg[0] = parsed.protocol + seg[0];
+              return seg.join(' ');
+            }).join(', ');
+            return `srcset=${q1}${rewritten}${q2}`;
+          })
+          .replace(/url\((['"]?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
+          .replace(/url\((['"]?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
+          .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || '')));
+        res.removeHeader('X-Frame-Options');
+        res.removeHeader('x-frame-options');
+        res.removeHeader('Content-Security-Policy');
+        res.removeHeader('content-security-policy');
+        res.setHeader('X-Frame-Options', 'ALLOWALL');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.send(html);
+      }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.send(renderProxyFallbackHtml(parsed.href));
     }
     if (ct.includes('text/html')) {
       let html = await upstream.text();
       if (looksLikeBotChallenge(html)) {
+        const readerFallback = await tryReaderProxy(target, req);
+        if (readerFallback) {
+          html = readerFallback.html;
+          const base = `${parsed.protocol}//${parsed.host}`;
+          html = html
+            .replace(/(href|src|action)=("|')\/(?!\/)/g, `$1=$2${base}/`)
+            .replace(/(href|src|action)=("|')\/\//g, `$1=$2${parsed.protocol}//`)
+            .replace(/srcset=("|')([^"']+)("|')/gi, (m, q1, list, q2) => {
+              const rewritten = list.split(',').map(part => {
+                const seg = part.trim().split(/\s+/);
+                if (seg[0].startsWith('/') && !seg[0].startsWith('//')) seg[0] = base + seg[0];
+                else if (seg[0].startsWith('//')) seg[0] = parsed.protocol + seg[0];
+                return seg.join(' ');
+              }).join(', ');
+              return `srcset=${q1}${rewritten}${q2}`;
+            })
+            .replace(/url\((['"]?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
+            .replace(/url\((['"]?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
+            .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || '')));
+          res.removeHeader('X-Frame-Options');
+          res.removeHeader('x-frame-options');
+          res.removeHeader('Content-Security-Policy');
+          res.removeHeader('content-security-policy');
+          res.setHeader('X-Frame-Options', 'ALLOWALL');
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          return res.send(html);
+        }
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send(renderProxyFallbackHtml(parsed.href));
       }
