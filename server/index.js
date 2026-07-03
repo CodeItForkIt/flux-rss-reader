@@ -173,6 +173,25 @@ async function requireAuth(req, res, next) {
   } catch (e) { res.status(500).json({ error: `Auth check failed: ${e.message}` }); }
 }
 
+function proxyBypassAllowed(req) {
+  if (req.path !== '/proxy') return false;
+  const secFetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
+  const secFetchMode = String(req.headers['sec-fetch-mode'] || '').toLowerCase();
+  const referer = req.headers.referer || '';
+  const origin = req.headers.origin || '';
+  const host = req.headers.host || '';
+  const sameOriginReferer = !!referer && (() => {
+    try {
+      const u = new URL(referer);
+      return u.origin === `${req.protocol}://${host}`;
+    } catch {
+      return false;
+    }
+  })();
+  const sameOriginOrigin = !!origin && origin === `${req.protocol}://${host}`;
+  return secFetchDest === 'iframe' || secFetchMode === 'navigate' || sameOriginReferer || sameOriginOrigin;
+}
+
 // A request originating from localhost or the same private network isn't
 // subject to the internet-facing brute-force/abuse concerns rate limiting
 // exists for — the operator running curl against their own box, or another
@@ -356,6 +375,7 @@ app.put('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
 // Every route below this line requires a valid device session token.
 app.use('/api/', (req, res, next) => {
   if (req.path.startsWith('/auth/') || req.path === '/health') return next();
+  if (req.path === '/proxy' && (proxyBypassAllowed(req) || getSessionToken(req))) return next();
   requireAuth(req, res, next);
 });
 
@@ -621,7 +641,7 @@ app.get('/api/proxy', async (req, res) => {
         // CSS url(...) in <style> blocks and inline style attributes
         .replace(/url\((["']?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
         .replace(/url\((["']?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
-        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base));
+        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || '')));
       // Strip ALL frame-blocking mechanisms — X-Frame-Options and CSP
       // frame-ancestors both prevent the proxy iframe from rendering.
       res.removeHeader('X-Frame-Options');
@@ -638,17 +658,20 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) { res.status(502).send(`Proxy fetch failed: ${e.message}`); }
 });
 
-function buildProxyShim(base) {
+function buildProxyShim(base, token) {
   // Runs before any of the page's own <script> tags. Rewrites same-page
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
     var BASE=${JSON.stringify(base)};
+    var TOKEN=${JSON.stringify(token || '')};
     function toProxied(u){
       try{
         var abs=new URL(u, document.baseURI).href;
         if (abs.indexOf(location.origin+'/api/proxy')===0) return u; // already proxied
-        return '/api/proxy?url='+encodeURIComponent(abs);
+        var proxied='/api/proxy?url='+encodeURIComponent(abs);
+        if (TOKEN) proxied += '&token='+encodeURIComponent(TOKEN);
+        return proxied;
       }catch(e){ return u; }
     }
     var of=window.fetch;

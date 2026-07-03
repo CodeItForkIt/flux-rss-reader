@@ -34,6 +34,9 @@ function authToken() {
   if (!IS_ELECTRON) { try { return localStorage.getItem(WEB_TOKEN_KEY); } catch { return null; } }
   return null;
 }
+export function getAuthToken() {
+  return authToken();
+}
 
 async function http(method, path, body, isFormData = false) {
   const headers = {};

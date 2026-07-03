@@ -6,7 +6,8 @@ function getCookieValue(cookieHeader, name) {
   for (const chunk of (cookieHeader || '').split(';')) {
     const [rawName, ...rawValue] = chunk.trim().split('=');
     if (!rawName) continue;
-    if (rawName === name) return decodeURIComponent(rawValue.join('='));
+    const trimmedName = rawName.trim();
+    if (trimmedName === name) return decodeURIComponent(rawValue.join('='));
   }
   return null;
 }
@@ -39,19 +40,24 @@ function buildCookieValue(token, host, req) {
 function getSessionToken(req) {
   const headerToken = req.headers.authorization || '';
   if (headerToken.startsWith('Bearer ')) return headerToken.slice(7);
+  const queryToken = req.query?.token;
+  if (typeof queryToken === 'string' && queryToken) return queryToken;
   return getCookieValue(req.headers.cookie || '', SESSION_COOKIE_NAME);
 }
 
 function setSessionCookie(res, token, req) {
   const hosts = getHostCandidates(req);
-  const cookies = hosts.map((host) => buildCookieValue(token, host, req));
-  res.setHeader('Set-Cookie', cookies);
+  for (const host of hosts) {
+    res.append('Set-Cookie', buildCookieValue(token, host, req));
+  }
 }
 
 function clearSessionCookie(res, req) {
   const hosts = getHostCandidates(req);
-  const cookies = hosts.map((host) => `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${host && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1' ? `; Domain=${host}` : ''}`);
-  res.setHeader('Set-Cookie', cookies);
+  for (const host of hosts) {
+    const cookieValue = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${host && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1' ? `; Domain=${host}` : ''}`;
+    res.append('Set-Cookie', cookieValue);
+  }
 }
 
 module.exports = {

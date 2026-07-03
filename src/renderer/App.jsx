@@ -732,7 +732,12 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
 
   // Web mode: proxy through the backend so X-Frame-Options/CSP headers that
   // would otherwise block framing are stripped server-side.
-  const proxiedSrc = `/api/proxy?url=${encodeURIComponent(current)}`;
+  const proxiedSrc = useMemo(() => {
+    const params = new URLSearchParams({ url: current });
+    const token = api.getAuthToken();
+    if (token) params.set('token', token);
+    return `/api/proxy?${params.toString()}`;
+  }, [current]);
 
   const pushHistory = useCallback((newUrl) => {
     if (!newUrl || newUrl === 'about:blank') return;
@@ -898,7 +903,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
               ref={iframeRef}
               src={proxiedSrc}
               onLoad={handleIframeLoad}
-              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
               style={{ flex:1, border:'none', background:'#fff' }}
               title="Inline browser"
             />
