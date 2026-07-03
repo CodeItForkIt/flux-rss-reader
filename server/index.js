@@ -193,6 +193,7 @@ async function rateLimitingActive(req) {
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
 
+app.set('trust proxy', true);
 app.use(helmet({
   contentSecurityPolicy: false, // the SPA and inline-browser proxy both need inline scripts/styles; a real CSP here would need per-route tuning
   crossOriginEmbedderPolicy: false,
@@ -246,7 +247,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   const user = await db.createUser(username.trim(), hash, isFirstUser, email ? email.trim() : null);
   const token = newToken();
   await db.createSession(user.id, token, req.body?.deviceLabel || null);
-  setSessionCookie(res, token);
+  setSessionCookie(res, token, req);
   res.json({ token, username: user.username, isAdmin: user.isAdmin });
 });
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -268,13 +269,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
   const token = newToken();
   await db.createSession(user.id, token, req.body?.deviceLabel || null);
-  setSessionCookie(res, token);
+  setSessionCookie(res, token, req);
   res.json({ token, username: user.username, isAdmin: !!user.isAdmin });
 });
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
   const token = getSessionToken(req);
   if (token) await db.deleteSession(token);
-  clearSessionCookie(res);
+  clearSessionCookie(res, req);
   res.json({ ok: true });
 });
 app.get('/api/auth/me', requireAuth, async (req, res) => {

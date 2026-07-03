@@ -2,11 +2,9 @@
 
 A cross-platform RSS reader. Three ways to access it:
 
-- **Electron** (primary, Linux desktop app) — local storage, no login, full
-  `<webview>`-based inline browser
-- **Self-hosted web server** (optional) — multi-user, JWT auth, per-user
-  SQLite-backed data; run directly with Node, no Docker required
-- **Vercel-hosted Web App** - Access at flux-rss-reader.vercel.app and login/make an account. All the features below except for AI features due to Vercel limitations.
+- **Electron** (desktop app) — local storage, no login, full `<webview>`-based inline browser
+- **Self-hosted web server** (recommended for shared use) — account-based auth, per-user feeds and settings, and a web UI that works on desktop and mobile
+- **Vercel-hosted Web App** — access at flux-rss-reader.vercel.app, with account login and most reader features, but without the local-only AI features
 
 Features: real RSS fetching, Readability reader mode, per-feed CSS/HTML
 element blocking with a visual point-and-click picker, paywall bypass chain
@@ -96,7 +94,9 @@ separate account. See below for running the API server it talks to.
 
 ---
 
-## Self-hosted web server (no auth, no Docker)
+### Self-hosted web server (auth + web UI)
+
+For Vercel + Supabase deployments, the same session cookie is used for the web UI and the inline-browser proxy. Make sure the deployment is served over HTTPS and that `SUPABASE_URL` plus `SUPABASE_SERVICE_ROLE_KEY` are configured so the server can read and write account/session data in Supabase.
 
 ```bash
 npm run dev:server      # starts Express on :3000
@@ -113,9 +113,9 @@ The Vite dev server (`:5173`) proxies `/api/*` to `:3000`, so visiting
   mobile browser actually talks to. Not needed at all if you're only using
   the Electron app.
 
-**No authentication.** Anyone who can reach port 3000 on your machine can
-read and modify your feeds. Run behind a VPN, local network, or reverse
-proxy if you need access control.
+The web UI now uses account-based sessions. Register the first account to create the admin user, then sign in normally. The same session is used for the inline-browser proxy, so opening an article in inline-browser mode stays authenticated instead of falling back to the “Not authenticated” error.
+
+If you run the web UI from a different host/port combination (for example `localhost` versus `127.0.0.1`) during development, the server will mirror the session cookie across those local hosts so the browser and proxy keep working.
 
 ### Sharing data between Electron and the web server
 
