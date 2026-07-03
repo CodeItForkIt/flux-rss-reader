@@ -45,7 +45,14 @@ const GLOBAL_CSS = `
   .reader-body pre code { background:none; padding:0; word-break:normal; white-space:pre; }
   .reader-body ul,.reader-body ol { margin:0.75em 0 0.75em 1.5em; }
   .reader-body li { margin-bottom:0.4em; }
-  .reader-body img { max-width:100%; height:auto; border-radius:6px; margin:0.5em 0; }
+  /* Browsers already auto-reserve space for <img> elements that have real
+     width/height HTML attributes (a built-in default, not something CSS
+     needs to replicate). The fallback below only kicks in for images that
+     lack those attributes entirely — very common with third-party article
+     HTML — which would otherwise render at 0 height until loaded and cause
+     the page to visibly jump as each one pops in. */
+  .reader-body img { max-width:100%; height:auto; border-radius:6px; margin:0.5em 0; background:${T.surfaceActive}; }
+  .reader-body img:not([width]):not([height]) { aspect-ratio: 16 / 9; }
   .reader-body iframe,.reader-body video,.reader-body embed,.reader-body object { max-width:100%; }
   .reader-body .flux-lead-image { margin:0 0 1.4em; }
   .reader-body .flux-lead-image img { width:100%; max-height:420px; object-fit:cover; border-radius:10px; margin:0; }
@@ -936,7 +943,21 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
               ref={iframeRef}
               src={proxiedSrc}
               onLoad={handleIframeLoad}
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
+              // NOTE: deliberately does NOT include allow-same-origin. This
+              // iframe's document is served from OUR OWN origin (/api/proxy),
+              // just displaying a rewritten copy of someone else's page —
+              // allow-same-origin + allow-scripts together would let that
+              // page's JS treat itself as genuinely same-origin with the
+              // real Flux app: reaching into window.parent's DOM, and
+              // making credentialed fetch()/XHR calls to /api/* that read
+              // real responses (feeds, settings, everything) instead of
+              // being blocked as cross-origin. The opaque sandboxed origin
+              // this omission produces is what actually protects the app;
+              // some sites may behave slightly worse (e.g. code that
+              // assumes persistent per-origin storage) as a result — that's
+              // an acceptable trade for not exposing the whole account to
+              // any page a feed happens to link to.
+              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
               style={{ flex:1, border:'none', background:'#fff' }}
               title="Inline browser"
             />
