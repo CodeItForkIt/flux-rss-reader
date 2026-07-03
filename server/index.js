@@ -32,6 +32,7 @@ const QRCode  = require('qrcode');
 const helmet   = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { spawn } = require('child_process');
+const { chromium } = require('playwright');
 const { createStore } = require('./store-factory');
 const { getSessionToken, setSessionCookie, clearSessionCookie } = require('./auth-utils');
 
@@ -240,14 +241,26 @@ function renderProxyFallbackHtml(targetUrl) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Open this page in your browser</title><style>body{font-family:Inter,system-ui,sans-serif;background:#0e0e12;color:#e6e6f0;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px} .card{max-width:520px;background:#16161c;border:1px solid #28283a;border-radius:12px;padding:24px;line-height:1.6} a{color:#7c6af7;text-decoration:none} a:hover{text-decoration:underline}</style></head><body><div class="card"><h1 style="margin:0 0 8px;font-size:20px">This site blocked the inline view</h1><p style="margin:0 0 12px">Flux could not render this page inside the embedded browser because the site challenged the request as automated traffic. Opening the original page in a new browser tab is the most reliable option.</p><p><a href="${safeTarget}" target="_blank" rel="noopener noreferrer">Open the original page ↗</a></p></div><script>window.open(${JSON.stringify(targetUrl)}, '_blank', 'noopener,noreferrer');</script></body></html>`;
 }
 
-async function tryReaderProxy(target, req) {
-  const readerUrl = `https://r.jina.ai/http://${target.replace(/^https?:\/\//i, '')}`;
-  const upstream = await fetchWithCookies(readerUrl, { headers: buildProxyForwardHeaders(req) }, cookieJars);
-  if (!upstream.ok) return null;
-  const ct = upstream.headers.get('content-type') || '';
-  if (!ct.includes('text/html')) return null;
-  const html = await upstream.text();
-  return html && html.length > 500 ? { html, contentType: ct } : null;
+async function tryBrowserProxy(target, req) {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({
+      userAgent: req.headers['user-agent'] || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1440, height: 1400 },
+      extraHTTPHeaders: buildProxyForwardHeaders(req),
+    });
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2500);
+    const html = await page.content();
+    const title = await page.title();
+    return html && html.length > 500 ? { html, title, contentType: 'text/html; charset=utf-8' } : null;
+  } catch (e) {
+    console.warn('[proxy/browser]', e.message);
+    return null;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 // A request originating from localhost or the same private network isn't
@@ -679,9 +692,9 @@ app.get('/api/proxy', async (req, res) => {
     const upstream = await fetchWithCookies(target, { headers: buildProxyForwardHeaders(req) }, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
     if (!upstream.ok && [403, 429, 503].includes(upstream.status)) {
-      const readerFallback = await tryReaderProxy(target, req);
-      if (readerFallback) {
-        let html = readerFallback.html;
+      const browserFallback = await tryBrowserProxy(target, req);
+      if (browserFallback) {
+        let html = browserFallback.html;
         const base = `${parsed.protocol}//${parsed.host}`;
         html = html
           .replace(/(href|src|action)=("|')\/(?!\/)/g, `$1=$2${base}/`)
@@ -712,9 +725,9 @@ app.get('/api/proxy', async (req, res) => {
     if (ct.includes('text/html')) {
       let html = await upstream.text();
       if (looksLikeBotChallenge(html)) {
-        const readerFallback = await tryReaderProxy(target, req);
-        if (readerFallback) {
-          html = readerFallback.html;
+        const browserFallback = await tryBrowserProxy(target, req);
+        if (browserFallback) {
+          html = browserFallback.html;
           const base = `${parsed.protocol}//${parsed.host}`;
           html = html
             .replace(/(href|src|action)=("|')\/(?!\/)/g, `$1=$2${base}/`)
