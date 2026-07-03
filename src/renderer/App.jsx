@@ -854,7 +854,12 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
     setLoading(false);
     try {
       const loc = iframeRef.current?.contentWindow?.location?.href;
-      if (loc && loc !== 'about:blank') pushHistory(loc);
+      if (!loc || loc === 'about:blank') return;
+
+      const proxiedHref = new URL(proxiedSrc, window.location.href).href;
+      const parsedLoc = new URL(loc);
+      if (parsedLoc.origin === window.location.origin && parsedLoc.pathname === '/api/proxy') return;
+      if (loc !== proxiedHref && !loc.startsWith(proxiedHref)) pushHistory(loc);
     } catch {} // cross-origin — expected, ignore
   };
 
