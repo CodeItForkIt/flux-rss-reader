@@ -176,7 +176,7 @@ function registerIPC() {
 
   ipcMain.handle('feeds:remove', (_, id) => { db.removeFeed(USER_ID, id); return true; });
 
-  ipcMain.handle('feeds:updateRules', (_, { feedId, cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder }) => {
+  ipcMain.handle('feeds:updateRules', (_, { feedId, cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url }) => {
     const patch = {};
     if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
     if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -187,7 +187,17 @@ function registerIPC() {
     if (favicon       !== undefined) patch.favicon       = favicon;
     if (titleBlocklist!== undefined) patch.titleBlocklist= titleBlocklist;
     if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
+    let oldUrl = null;
+    if (url !== undefined) {
+      let newUrl = url.trim();
+      if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
+      const existing = db.findFeed(USER_ID, feedId);
+      oldUrl = existing?.url || null;
+      patch.url = newUrl;
+      patch.isYoutube = newUrl.includes('youtube.com');
+    }
     db.updateFeed(USER_ID, feedId, patch);
+    if (oldUrl) articleCache.delete(oldUrl); // old URL's cached content is no longer relevant once the feed points elsewhere
     // Bust the article cache whenever a feed's block rules change. Without
     // this, the element picker's "did the rule actually work?" verification
     // re-fetch was hitting a cached copy of the article fetched *before*

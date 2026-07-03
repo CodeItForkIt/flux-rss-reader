@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { encrypt, decrypt, hashToken } = require('./crypto-util');
 
 const EMPTY = () => ({
   nextUserId: 1,
@@ -38,13 +39,27 @@ class JSONStore {
   }
 
   _load() {
+    let raw;
     try {
-      const raw = fs.readFileSync(this.filePath, 'utf8');
+      raw = fs.readFileSync(this.filePath, 'utf8');
+    } catch (e) {
+      if (e.code === 'ENOENT') return EMPTY(); // genuinely first run — fine to start fresh
+      // Any other read failure (permissions, a typo'd DB_PATH pointing at a
+      // directory, etc.) used to be silently swallowed here and fell back
+      // to an empty store — which looks identical to "my data is gone" and,
+      // worse, the next mutation would then overwrite the real file at that
+      // path with near-empty defaults. Fail loudly instead.
+      console.error(`\x1b[31m✗ Could not read database at ${this.filePath}: ${e.message}\x1b[0m`);
+      console.error(`  Refusing to start with an empty store — fix the path/permissions and restart.`);
+      process.exit(1);
+    }
+    try {
       const parsed = JSON.parse(raw);
-      // Merge with EMPTY to backfill any new top-level keys on upgrade
-      return { ...EMPTY(), ...parsed };
-    } catch {
-      return EMPTY();
+      return { ...EMPTY(), ...parsed }; // backfill any new top-level keys on upgrade
+    } catch (e) {
+      console.error(`\x1b[31m✗ Database file at ${this.filePath} exists but isn't valid JSON: ${e.message}\x1b[0m`);
+      console.error(`  Refusing to start with an empty store and overwrite it — check the file, or restore from a backup.`);
+      process.exit(1);
     }
   }
 
@@ -60,10 +75,10 @@ class JSONStore {
 
   // ─── Users ──────────────────────────────────────────────────────────────
   findUserByUsername(username) {
-    return this.data.users.find(u => u.username === username);
+    return this._decryptUser(this.data.users.find(u => u.username === username));
   }
   findUserById(id) {
-    return this.data.users.find(u => u.id === id);
+    return this._decryptUser(this.data.users.find(u => u.id === id));
   }
   createUser(username, passwordHash, isAdmin = false, email = null) {
     const id = this.data.nextUserId++;
@@ -76,20 +91,42 @@ class JSONStore {
     return this.data.users.length;
   }
   findUserByEmail(email) {
-    return this.data.users.find(u => u.email && u.email.toLowerCase() === (email || '').toLowerCase());
+    return this._decryptUser(this.data.users.find(u => u.email && u.email.toLowerCase() === (email || '').toLowerCase()));
   }
   updateUser(id, patch) {
-    const user = this.findUserById(id);
+    // Must mutate the real object in this.data.users, not a decrypted copy
+    // (findUserById returns a fresh {...user} object via _decryptUser) —
+    // otherwise Object.assign below would silently modify a throwaway
+    // object and none of it would ever be saved.
+    const user = this.data.users.find(u => u.id === id);
     if (!user) return null;
     const safePatch = { ...patch };
     delete safePatch.__proto__; delete safePatch.constructor; delete safePatch.prototype;
     delete safePatch.id; // never allow the primary key to be overwritten via patch
+    // 2FA secrets are the one thing in this store that grants ongoing
+    // access to an account (unlike a password, which is already hashed) —
+    // encrypt them at rest so a copy of the data file alone doesn't hand
+    // over the ability to generate valid codes.
+    if ('twoFactorSecret' in safePatch) safePatch.twoFactorSecret = safePatch.twoFactorSecret ? encrypt(this.filePath, safePatch.twoFactorSecret) : null;
+    if ('pendingTwoFactorSecret' in safePatch) safePatch.pendingTwoFactorSecret = safePatch.pendingTwoFactorSecret ? encrypt(this.filePath, safePatch.pendingTwoFactorSecret) : null;
     Object.assign(user, safePatch);
     this._save();
-    return user;
+    return this._decryptUser(user);
+  }
+  // findUserById/findUserByUsername/findUserByEmail all need decrypted
+  // secrets available to the caller (e.g. to verify a TOTP code against
+  // twoFactorSecret) — decrypt on the way out rather than keeping two
+  // copies of every user object in memory.
+  _decryptUser(user) {
+    if (!user) return user;
+    const out = { ...user };
+    if (out.twoFactorSecret) out.twoFactorSecret = decrypt(this.filePath, out.twoFactorSecret);
+    if (out.pendingTwoFactorSecret) out.pendingTwoFactorSecret = decrypt(this.filePath, out.pendingTwoFactorSecret);
+    return out;
   }
   deleteSessionsForUser(userId, exceptToken) {
-    this.data.sessions = this.data.sessions.filter(s => s.userId !== userId || s.token === exceptToken);
+    const exceptHash = exceptToken ? hashToken(exceptToken) : null;
+    this.data.sessions = this.data.sessions.filter(s => s.userId !== userId || s.tokenHash === exceptHash);
     this._save();
   }
 
@@ -108,21 +145,28 @@ class JSONStore {
   // by the client indefinitely (localStorage / a settings file) — that's
   // the "once per device" model: log in once per browser/app install, stay
   // logged in until an explicit logout or the session is revoked.
+  //
+  // Only a SHA-256 hash of the token is ever written to disk — same idea
+  // as hashing a password. The real token only ever exists in the request
+  // itself and in the client's own storage; a copy of the data file can't
+  // be used to impersonate an active session.
   createSession(userId, token, label) {
-    const session = { token, userId, createdAt: Date.now(), lastSeenAt: Date.now(), label: label || null };
+    const session = { tokenHash: hashToken(token), userId, createdAt: Date.now(), lastSeenAt: Date.now(), label: label || null };
     this.data.sessions.push(session);
     this._save();
     return session;
   }
   findSession(token) {
-    return this.data.sessions.find(s => s.token === token);
+    const h = hashToken(token);
+    return this.data.sessions.find(s => s.tokenHash === h);
   }
   touchSession(token) {
     const s = this.findSession(token);
     if (s) { s.lastSeenAt = Date.now(); this._save(); }
   }
   deleteSession(token) {
-    this.data.sessions = this.data.sessions.filter(s => s.token !== token);
+    const h = hashToken(token);
+    this.data.sessions = this.data.sessions.filter(s => s.tokenHash !== h);
     this._save();
   }
   listSessions(userId) {
@@ -233,6 +277,44 @@ class JSONStore {
   setSettings(userId, settings) {
     this.data.settings[userId] = settings;
     this._save();
+  }
+
+  // ─── Article content cache ───────────────────────────────────────────────
+  // Kept in a separate file from the main data file (not folded into
+  // this.data) so that every article fetch doesn't also rewrite the much
+  // larger feeds/folders/settings blob to disk on every request.
+  _loadCache() {
+    if (this._cacheData) return this._cacheData;
+    const cachePath = this.filePath.replace(/\.json$/, '-article-cache.json');
+    this._cachePath = cachePath;
+    try { this._cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf8')); }
+    catch { this._cacheData = {}; }
+    return this._cacheData;
+  }
+  _flushCache() {
+    try {
+      fs.mkdirSync(path.dirname(this._cachePath), { recursive: true });
+      const tmp = this._cachePath + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(this._cacheData));
+      fs.renameSync(tmp, this._cachePath);
+    } catch (e) { console.error('[article-cache] flush failed:', e.message); }
+  }
+  async cacheGet(url) {
+    const data = this._loadCache();
+    return data[url] || null;
+  }
+  async cacheSet(url, entry) {
+    const data = this._loadCache();
+    data[url] = entry;
+    this._flushCache();
+  }
+  async cacheDelete(url) {
+    const data = this._loadCache();
+    delete data[url];
+    this._flushCache();
+  }
+  async cacheEntries() {
+    return Object.entries(this._loadCache());
   }
 }
 

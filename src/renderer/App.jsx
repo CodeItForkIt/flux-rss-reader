@@ -2051,10 +2051,35 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [titleBlocklist,setTitleBlocklist]=useState((feed?.titleBlocklist||[]).join('\n'));
   const [strategyOverride,setStrategyOverride]=useState(!!feed?.fetchStrategyOrder?.length);
   const [strategyOrder,setStrategyOrder]=useState(feed?.fetchStrategyOrder?.length?feed.fetchStrategyOrder:FETCH_STRATEGY_NAMES_FALLBACK);
-  const save=async()=>{ await onSave({feedId:feed.id,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[]}); onClose(); };
+  const [editingUrl,setEditingUrl]=useState(false);
+  const [url,setUrl]=useState(feed?.url||'');
+  const [urlError,setUrlError]=useState(null);
+  const save=async()=>{
+    setUrlError(null);
+    try {
+      await onSave({feedId:feed.id,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[], ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
+      onClose();
+    } catch(e) { setUrlError(e.message); }
+  };
   return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <div style={{ background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:'10px 14px', fontSize:12, color:T.textMuted, lineHeight:1.6 }}>Rules are applied <strong style={{ color:T.text }}>before</strong> Readability extracts the article.</div>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Feed URL</label>
+        {!editingUrl ? (
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            <div style={{ flex:1, fontFamily:"'JetBrains Mono',monospace", fontSize:11.5, color:T.textMuted, background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:6, padding:'7px 10px', wordBreak:'break-all' }}>{feed?.url}</div>
+            <Btn small variant="outline" onClick={()=>setEditingUrl(true)}>Change</Btn>
+          </div>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            <input value={url} onChange={e=>{setUrl(e.target.value);setUrlError(null);}} style={{ width:'100%', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
+            <div style={{ fontSize:11, color:T.textMuted }}>Changing this points the feed at a different source — existing articles stay, new ones come from the new URL.</div>
+            {urlError && <div style={{ fontSize:11, color:T.danger }}>{urlError}</div>}
+            <div><Btn small variant="outline" onClick={()=>{setEditingUrl(false);setUrl(feed?.url||'');setUrlError(null);}}>Cancel change</Btn></div>
+          </div>
+        )}
+      </div>
       <div>
         <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Folder</label>
         <select value={folder} onChange={e=>setFolder(e.target.value)} style={{ width:'100%' }}>
@@ -2419,8 +2444,12 @@ function AccountSection() {
         {!me?.twoFactorEnabled && !show2faSetup && <Btn small variant="outline" onClick={start2fa} disabled={busy}>Set up two-factor authentication</Btn>}
         {show2faSetup && (
           <div style={{ display:'flex', flexDirection:'column', gap:8, background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:12 }}>
-            <div style={{ fontSize:12, color:T.textMuted }}>Scan this into an authenticator app (Google Authenticator, 1Password, etc.), or enter the code manually:</div>
-            <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, wordBreak:'break-all', background:T.surface, padding:8, borderRadius:6 }}>{show2faSetup.secret}</div>
+            <div style={{ fontSize:12, color:T.textMuted }}>Scan this with your authenticator app (Google Authenticator, Authy, 1Password, Bitwarden, etc.):</div>
+            <img src={show2faSetup.qrCodeDataUrl} alt="2FA QR code" style={{ width:180, height:180, alignSelf:'center', borderRadius:8, background:'#fff', padding:8 }} />
+            <details style={{ fontSize:11, color:T.textSubtle }}>
+              <summary style={{ cursor:'pointer' }}>Can't scan? Enter manually</summary>
+              <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, wordBreak:'break-all', background:T.surface, padding:8, borderRadius:6, marginTop:6, color:T.text }}>{show2faSetup.secret}</div>
+            </details>
             <input inputMode="numeric" placeholder="Enter 6-digit code to confirm" value={code} onChange={e=>setCode(e.target.value)} style={{ letterSpacing:'0.2em', textAlign:'center' }} />
             <div style={{ display:'flex', gap:8 }}>
               <Btn small variant="outline" onClick={()=>{setShow2faSetup(null);setCode('');}}>Cancel</Btn>
@@ -2578,10 +2607,26 @@ function ContextMenu({ x, y, items, onClose }) {
   useEffect(()=>{
     const close = () => onClose();
     const esc = (e)=>{ if(e.key==='Escape') onClose(); };
-    window.addEventListener('click', close);
-    window.addEventListener('contextmenu', close);
-    window.addEventListener('keydown', esc);
-    return ()=>{ window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); window.removeEventListener('keydown', esc); };
+    // Attaching these listeners immediately can let the very tap/click that
+    // opened the menu also be the one that closes it — on mobile, touch
+    // events synthesize a following 'click' with timing that isn't always
+    // safely past the handler that just called setMobileMoreMenu(...), and
+    // even on desktop a fast double-fire is possible. Deferring to the
+    // next tick guarantees the opening interaction has fully finished
+    // before anything can dismiss the menu.
+    const timer = setTimeout(() => {
+      window.addEventListener('click', close);
+      window.addEventListener('touchend', close);
+      window.addEventListener('contextmenu', close);
+      window.addEventListener('keydown', esc);
+    }, 0);
+    return ()=>{
+      clearTimeout(timer);
+      window.removeEventListener('click', close);
+      window.removeEventListener('touchend', close);
+      window.removeEventListener('contextmenu', close);
+      window.removeEventListener('keydown', esc);
+    };
   },[onClose]);
 
   // Keep on-screen
@@ -2833,6 +2878,8 @@ function MobileLayout({
                         : <span style={{ fontSize:12, color:feed.isYoutube?T.youtube:T.accent, flexShrink:0 }}>{feed.isYoutube?'▶':'◉'}</span>}
                       <span style={{ flex:1, fontSize:14, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{feed.name}</span>
                       {cnt>0 && <span style={{ fontSize:11, fontWeight:700, color:T.accent, marginRight:2 }}>{cnt}</span>}
+                      <button onClick={(e)=>{ e.stopPropagation(); setRulesTarget(feed); closeSheet(); }}
+                        style={{ background:'transparent', border:'none', color:T.textSubtle, fontSize:14, padding:'2px 6px', cursor:'pointer', flexShrink:0 }}>⚙</button>
                       <button onClick={(e)=>{ e.stopPropagation(); if (confirm(`Remove feed "${feed.name}"?`)) handleRemoveFeed(feed.id); }}
                         style={{ background:'transparent', border:'none', color:T.danger, fontSize:13, padding:'2px 6px', cursor:'pointer', flexShrink:0 }}>✕</button>
                     </div>
@@ -2862,6 +2909,8 @@ function MobileLayout({
                   : <span style={{ fontSize:12, color:feed.isYoutube?T.youtube:T.accent, flexShrink:0 }}>{feed.isYoutube?'▶':'◉'}</span>}
                 <span style={{ flex:1, fontSize:14, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{feed.name}</span>
                 {cnt>0 && <span style={{ fontSize:11, fontWeight:700, color:T.accent, marginRight:2 }}>{cnt}</span>}
+                <button onClick={(e)=>{ e.stopPropagation(); setRulesTarget(feed); closeSheet(); }}
+                  style={{ background:'transparent', border:'none', color:T.textSubtle, fontSize:14, padding:'2px 6px', cursor:'pointer', flexShrink:0 }}>⚙</button>
                 <button onClick={(e)=>{ e.stopPropagation(); if (confirm(`Remove feed "${feed.name}"?`)) handleRemoveFeed(feed.id); }}
                   style={{ background:'transparent', border:'none', color:T.danger, fontSize:13, padding:'2px 6px', cursor:'pointer', flexShrink:0 }}>✕</button>
               </div>
@@ -2886,7 +2935,7 @@ function MobileLayout({
   const unreadVisible = visibleArticles.filter(a=>!a.isRead).length;
 
   const listScreen = (
-    <div className={screenAnim==='back'?'slide-in-prev':''} style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+    <div className={screenAnim==='back'?'slide-in-prev':''} onAnimationEnd={()=>setScreenAnim(null)} style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
       <div style={{ padding:'14px 16px 10px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:8, flexShrink:0, background:T.surface }}>
         {(activeView!=='__all') && <IconBtn icon="←" size={26} onClick={()=>goToList('__all')} />}
         <span style={{ fontWeight:700, fontSize:17, flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{label}</span>
@@ -2905,7 +2954,7 @@ function MobileLayout({
 
   // ── Screen: Article reader (inline JSX — NOT a component) ───────────────────
   const articleScreen = (
-    <div className={screenAnim==='in'?'slide-in-next':''} style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+    <div className={screenAnim==='in'?'slide-in-next':''} onAnimationEnd={()=>setScreenAnim(null)} style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
       <div style={{ padding:'10px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:10, flexShrink:0, background:T.surface, paddingTop:'calc(10px + env(safe-area-inset-top))' }}>
         <IconBtn icon="←" title="Back" onClick={goBack} size={32} />
         <span style={{ flex:1, fontSize:14, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:T.text }}>{selectedArticle?.title||''}</span>

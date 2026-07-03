@@ -1,6 +1,6 @@
 'use strict';
 /**
- * server/index.js — Flux web server (no auth, single-user, no Docker)
+ * server/index.js — Flux web server (accounts + device-token auth, no Docker)
  *
  * Serves the same data file as the Electron app — point DB_PATH at the same
  * JSON file and the web UI and Electron share data seamlessly.
@@ -28,10 +28,11 @@ const crypto   = require('crypto');
 const multer   = require('multer');
 const bcrypt   = require('bcryptjs');
 const { authenticator } = require('otplib');
+const QRCode  = require('qrcode');
 const helmet   = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { spawn } = require('child_process');
-const { JSONStore } = require('./db');
+const { createStore } = require('./store-factory');
 
 const {
   loadDeps, fetchArticle, fetchFeed, fetchWithCookies,
@@ -78,7 +79,7 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || '').split(',').map(s => s.tr
 // by default, while still supporting more than one person.
 const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP === 'true';
 
-const db = new JSONStore(DB_PATH);
+const db = createStore(DB_PATH);
 
 // Single-user stub — all operations use userId = 1
 // Multi-user now — req.userId is set by the requireAuth middleware below
@@ -87,45 +88,35 @@ const db = new JSONStore(DB_PATH);
 // ─── In-memory cookie jars ────────────────────────────────────────────────────
 const cookieJars = {};
 
-// ─── Article content cache — file-backed so it survives server restarts ───────
-// Cache is stored as a JSON file next to the data file. In-memory object is
-// used as a fast read layer; every mutation also writes straight through to
-// disk synchronously — same durability guarantee db.js uses for everything
-// else, and for the same reason: a debounced/delayed write here means any
-// entry written (or busted) in that window is silently lost on restart,
-// which defeats the entire point of a file-backed cache. Article fetches
-// aren't high-frequency enough (a human reading one at a time) for the
-// extra disk I/O from writing on every mutation to matter in practice.
-const CACHE_PATH = DB_PATH.replace(/\.json$/, '-article-cache.json');
-let _cacheData = {};
-try { _cacheData = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8')); } catch {}
-function _flushCache() {
-  try {
-    fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
-    const tmp = CACHE_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(_cacheData));
-    fs.renameSync(tmp, CACHE_PATH);
-  } catch (e) { console.error('[article-cache] flush failed:', e.message); }
-}
+// ─── Article content cache ──────────────────────────────────────────────────
+// Thin wrapper around whichever store is active (db.cacheGet/Set/Delete/
+// Entries) — JSONStore backs this with a local file, SupabaseStore with a
+// Postgres table. Both are async here so this code doesn't need to know or
+// care which one is in play.
 const articleCache = {
-  get(url) { const e = _cacheData[url]; return e ? { ts: e.ts, feedId: e.feedId, result: e.result } : undefined; },
-  set(url, val) { _cacheData[url] = val; _flushCache(); },
-  delete(url) { delete _cacheData[url]; _flushCache(); },
+  get: (url) => db.cacheGet(url),
+  set: (url, val) => db.cacheSet(url, val),
+  delete: (url) => db.cacheDelete(url),
+  entries: () => db.cacheEntries(),
 };
-// Expose entries() for the per-feed cache bust
-articleCache.entries = function*() { yield* Object.entries(_cacheData); };
-// Prune expired entries on startup to keep the cache file from growing unboundedly
-function articleTtlMs(userId) {
+async function articleTtlMs(userId) {
   // No request context at startup (userId undefined) — use the 7-day
   // default rather than any specific user's setting, since this pass is
   // just a size-bounding optimization, not a per-request correctness check.
-  const days = userId != null ? (db.getSettings(userId).articleCacheDays ?? 7) : 7;
+  const days = userId != null ? ((await db.getSettings(userId)).articleCacheDays ?? 7) : 7;
   return days * 24 * 60 * 60 * 1000;
 }
-const startupTtl = articleTtlMs();
-for (const [url, entry] of Object.entries(_cacheData)) {
-  if (Date.now() - entry.ts > startupTtl) delete _cacheData[url];
-}
+// Prune expired entries on startup to keep the cache from growing
+// unboundedly. Best-effort — if the store isn't ready yet or this throws
+// for any reason, it's not worth failing startup over.
+(async () => {
+  try {
+    const startupTtl = await articleTtlMs();
+    for (const [url, entry] of await articleCache.entries()) {
+      if (Date.now() - entry.ts > startupTtl) await articleCache.delete(url);
+    }
+  } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
+})();
 
 // ─── SSRF guard ───────────────────────────────────────────────────────────────
 // /api/proxy, /api/feeds/resolve, and article/feed fetching all cause THIS
@@ -169,15 +160,17 @@ async function checkSsrfSafe(hostname) {
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 const TOKEN_HEADER = 'authorization';
 function newToken() { return crypto.randomBytes(32).toString('hex'); }
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers[TOKEN_HEADER] || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  const session = db.findSession(token);
-  if (!session) return res.status(401).json({ error: 'Session expired or invalid — please log in again.' });
-  db.touchSession(token);
-  req.userId = session.userId;
-  next();
+  try {
+    const session = await db.findSession(token);
+    if (!session) return res.status(401).json({ error: 'Session expired or invalid — please log in again.' });
+    db.touchSession(token).catch(()=>{}); // fire-and-forget — a failed "last seen" bump shouldn't block the request
+    req.userId = session.userId;
+    next();
+  } catch (e) { res.status(500).json({ error: `Auth check failed: ${e.message}` }); }
 }
 
 // A request originating from localhost or the same private network isn't
@@ -191,8 +184,9 @@ function isLocalRequest(req) {
   ip = ip.replace(/^::ffff:/, '');
   return ip === '127.0.0.1' || ip === '::1' || isPrivateOrReservedIp(ip);
 }
-function rateLimitingActive(req) {
-  return db.getSystemSettings().rateLimitEnabled && !isLocalRequest(req);
+async function rateLimitingActive(req) {
+  const sys = await db.getSystemSettings();
+  return sys.rateLimitEnabled && !isLocalRequest(req);
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -214,48 +208,49 @@ app.use(express.json({ limit: '2mb' }));
 // tighter limiter specifically on auth to slow down password guessing.
 // Both skip entirely for local/private-network requests and can be turned
 // off instance-wide from Admin Settings.
-app.use('/api/', rateLimit({ windowMs: 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false, skip: (req) => !rateLimitingActive(req) }));
+app.use('/api/', rateLimit({ windowMs: 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false, skip: async (req) => !(await rateLimitingActive(req)) }));
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-  skip: (req) => !rateLimitingActive(req),
+  skip: async (req) => !(await rateLimitingActive(req)),
   message: { error: 'Too many attempts — please wait a few minutes.' } });
 
-function signupOpen() {
-  return db.userCount() === 0 || db.getSystemSettings().allowSignup || ALLOW_SIGNUP;
+async function signupOpen() {
+  const sys = await db.getSystemSettings();
+  return (await db.userCount()) === 0 || sys.allowSignup || ALLOW_SIGNUP;
 }
 
 // ─── Health & auth status (public — no token required) ─────────────────────────
 app.get('/api/health', (_, res) => res.json({ ok: true, version: '0.2.0' }));
-app.get('/api/auth/status', (req, res) => {
-  res.json({ signupOpen: signupOpen() });
+app.get('/api/auth/status', async (req, res) => {
+  res.json({ signupOpen: await signupOpen() });
 });
 app.post('/api/auth/register', authLimiter, async (req, res) => {
-  const isFirstUser = db.userCount() === 0;
-  if (!isFirstUser && !signupOpen()) {
+  const isFirstUser = (await db.userCount()) === 0;
+  if (!isFirstUser && !(await signupOpen())) {
     return res.status(403).json({ error: 'Registration is closed on this server.' });
   }
   const { username, password, email } = req.body || {};
   if (!username || !password || password.length < 8) {
     return res.status(400).json({ error: 'Username and a password of at least 8 characters are required.' });
   }
-  if (db.findUserByUsername(username)) return res.status(409).json({ error: 'That username is taken.' });
+  if (await db.findUserByUsername(username)) return res.status(409).json({ error: 'That username is taken.' });
   // Email is optional but recommended — it's currently only used to help
   // identify an account (e.g. shown back to the person so they can confirm
   // which account they're in); there's no email-sending configured in this
   // server yet, so it isn't usable for verification or password-reset
   // emails until an SMTP/email-provider integration is added.
-  if (email && db.findUserByEmail(email)) return res.status(409).json({ error: 'That email is already associated with an account.' });
+  if (email && await db.findUserByEmail(email)) return res.status(409).json({ error: 'That email is already associated with an account.' });
   const hash = await bcrypt.hash(password, 12);
   // The very first account on a fresh instance is the admin — there's no
   // one else to grant that role, and someone standing up their own server
   // is implicitly the operator.
-  const user = db.createUser(username.trim(), hash, isFirstUser, email ? email.trim() : null);
+  const user = await db.createUser(username.trim(), hash, isFirstUser, email ? email.trim() : null);
   const token = newToken();
-  db.createSession(user.id, token, req.body?.deviceLabel || null);
+  await db.createSession(user.id, token, req.body?.deviceLabel || null);
   res.json({ token, username: user.username, isAdmin: user.isAdmin });
 });
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { username, password, totpCode } = req.body || {};
-  const user = db.findUserByUsername((username || '').trim());
+  const user = await db.findUserByUsername((username || '').trim());
   // Compare against a dummy hash even when the user doesn't exist, so
   // response timing doesn't reveal whether a username is registered.
   const hash = user?.password || '$2a$12$C6UzMDM.H6dfI/f/IKcEeOoM2r6MW5v2AZTGvj8XZfZq8v0Ry9k7C';
@@ -271,16 +266,16 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     }
   }
   const token = newToken();
-  db.createSession(user.id, token, req.body?.deviceLabel || null);
+  await db.createSession(user.id, token, req.body?.deviceLabel || null);
   res.json({ token, username: user.username, isAdmin: !!user.isAdmin });
 });
-app.post('/api/auth/logout', requireAuth, (req, res) => {
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
   const header = req.headers[TOKEN_HEADER] || '';
-  db.deleteSession(header.slice(7));
+  await db.deleteSession(header.slice(7));
   res.json({ ok: true });
 });
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  const user = db.findUserById(req.userId);
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  const user = await db.findUserById(req.userId);
   res.json({ username: user?.username, isAdmin: !!user?.isAdmin, email: user?.email || null, twoFactorEnabled: !!user?.twoFactorEnabled });
 });
 
@@ -292,10 +287,10 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 app.post('/api/auth/password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters.' });
-  const user = db.findUserById(req.userId);
+  const user = await db.findUserById(req.userId);
   const ok = await bcrypt.compare(currentPassword || '', user.password);
   if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
-  db.updateUser(user.id, { password: await bcrypt.hash(newPassword, 12) });
+  await db.updateUser(user.id, { password: await bcrypt.hash(newPassword, 12) });
   res.json({ ok: true });
 });
 
@@ -306,34 +301,35 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
 // secret before it's actually turned on — this confirms the app was set up
 // correctly, rather than possibly locking someone out with a secret they
 // never actually got working.
-app.post('/api/auth/2fa/setup', requireAuth, (req, res) => {
-  const user = db.findUserById(req.userId);
+app.post('/api/auth/2fa/setup', requireAuth, async (req, res) => {
+  const user = await db.findUserById(req.userId);
   const secret = authenticator.generateSecret();
-  db.updateUser(user.id, { pendingTwoFactorSecret: secret });
+  await db.updateUser(user.id, { pendingTwoFactorSecret: secret });
   const otpauth = authenticator.keyuri(user.username, 'Flux', secret);
-  res.json({ secret, otpauth });
+  const qrCodeDataUrl = await QRCode.toDataURL(otpauth, { width: 220, margin: 1 });
+  res.json({ secret, otpauth, qrCodeDataUrl });
 });
-app.post('/api/auth/2fa/enable', requireAuth, (req, res) => {
+app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
   const { code } = req.body || {};
-  const user = db.findUserById(req.userId);
+  const user = await db.findUserById(req.userId);
   if (!user.pendingTwoFactorSecret) return res.status(400).json({ error: 'Call /api/auth/2fa/setup first.' });
   if (!authenticator.check(String(code || '').replace(/\s/g, ''), user.pendingTwoFactorSecret)) {
     return res.status(401).json({ error: 'Invalid code — check the time on your device and try again.' });
   }
-  db.updateUser(user.id, { twoFactorSecret: user.pendingTwoFactorSecret, twoFactorEnabled: true, pendingTwoFactorSecret: null });
+  await db.updateUser(user.id, { twoFactorSecret: user.pendingTwoFactorSecret, twoFactorEnabled: true, pendingTwoFactorSecret: null });
   res.json({ ok: true });
 });
 app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
   const { password } = req.body || {};
-  const user = db.findUserById(req.userId);
+  const user = await db.findUserById(req.userId);
   const ok = await bcrypt.compare(password || '', user.password);
   if (!ok) return res.status(401).json({ error: 'Password is incorrect.' });
-  db.updateUser(user.id, { twoFactorSecret: null, twoFactorEnabled: false, pendingTwoFactorSecret: null });
+  await db.updateUser(user.id, { twoFactorSecret: null, twoFactorEnabled: false, pendingTwoFactorSecret: null });
   res.json({ ok: true });
 });
 
-function requireAdmin(req, res, next) {
-  const user = db.findUserById(req.userId);
+async function requireAdmin(req, res, next) {
+  const user = await db.findUserById(req.userId);
   if (!user?.isAdmin) return res.status(403).json({ error: 'Admin access required.' });
   next();
 }
@@ -343,14 +339,14 @@ function requireAdmin(req, res, next) {
 // for itself. Covers things that affect the whole server rather than one
 // person's experience: rate limiting, whether AI features are available
 // at all, and the shared Ollama connection they point at.
-app.get('/api/admin/settings', requireAuth, requireAdmin, (req, res) => {
-  res.json(db.getSystemSettings());
+app.get('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
+  res.json(await db.getSystemSettings());
 });
-app.put('/api/admin/settings', requireAuth, requireAdmin, (req, res) => {
+app.put('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
   const allowed = ['rateLimitEnabled', 'allowSignup', 'aiFeaturesEnabled', 'ollamaUrl', 'ollamaModel'];
   const patch = {};
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-  res.json(db.setSystemSettings(patch));
+  res.json(await db.setSystemSettings(patch));
 });
 
 // Every route below this line requires a valid device session token.
@@ -360,27 +356,27 @@ app.use('/api/', (req, res, next) => {
 });
 
 // ─── Folders ──────────────────────────────────────────────────────────────────
-app.get('/api/folders', (req, res) => {
-  res.json(db.listFolders(req.userId).map(f => ({ id: f.id, name: f.name, icon: f.icon })));
+app.get('/api/folders', async (req, res) => {
+  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon })));
 });
-app.post('/api/folders', (req, res) => {
+app.post('/api/folders', async (req, res) => {
   const { name, icon } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
-  res.json(db.addFolder(req.userId, name, icon || '◈'));
+  res.json(await db.addFolder(req.userId, name, icon || '◈'));
 });
-app.delete('/api/folders/:id', (req, res) => {
-  db.removeFolder(req.userId, req.params.id);
+app.delete('/api/folders/:id', async (req, res) => {
+  await db.removeFolder(req.userId, req.params.id);
   res.json({ ok: true });
 });
-app.put('/api/folders/reorder', (req, res) => {
+app.put('/api/folders/reorder', async (req, res) => {
   const { orderedIds } = req.body;
   if (!Array.isArray(orderedIds)) return res.status(400).json({ error: 'orderedIds array required' });
-  db.reorderFolders(req.userId, orderedIds);
+  await db.reorderFolders(req.userId, orderedIds);
   res.json({ ok: true });
 });
-app.patch('/api/folders/:id', (req, res) => {
+app.patch('/api/folders/:id', async (req, res) => {
   const { name, icon } = req.body;
-  const folder = db.updateFolder(req.userId, req.params.id, { name, icon });
+  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon });
   if (!folder) return res.status(404).json({ error: 'Not found' });
   res.json(folder);
 });
@@ -401,8 +397,8 @@ const feedRow = (f) => ({
   fetchStrategyOrder: f.fetchStrategyOrder || [],
 });
 
-app.get('/api/feeds', (req, res) => {
-  res.json(db.listFeeds(req.userId).map(feedRow));
+app.get('/api/feeds', async (req, res) => {
+  res.json((await db.listFeeds(req.userId)).map(feedRow));
 });
 // Feed discovery: paste a YouTube channel/video URL, a channel @handle
 // URL, or any regular website URL, and resolve it to an actual feed URL.
@@ -445,19 +441,19 @@ app.post('/api/feeds', async (req, res) => {
   // physical article then appears to "phantom" into whichever folder the
   // second, possibly-misfiled feed entry happens to be in, and shows up
   // duplicated in unfiltered views.
-  if (db.feedUrlExists(req.userId, url)) {
+  if (await db.feedUrlExists(req.userId, url)) {
     return res.status(409).json({ error: 'This feed is already added.' });
   }
 
-  const feed = db.addFeed(req.userId, {
+  const feed = await db.addFeed(req.userId, {
     name: name || hostname, url, folder: folder || null,
     isYoutube: url.includes('youtube.com'), inlineBrowser: !!inlineBrowser,
     hideShorts: !!hideShorts, cssSelectors, htmlPatterns, favicon: null,
   });
   res.json(feedRow(feed));
 });
-app.patch('/api/feeds/:id', (req, res) => {
-  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder } = req.body;
+app.patch('/api/feeds/:id', async (req, res) => {
+  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url } = req.body;
   const patch = {};
   if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
   if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -468,28 +464,47 @@ app.patch('/api/feeds/:id', (req, res) => {
   if (favicon       !== undefined) patch.favicon       = favicon;
   if (titleBlocklist!== undefined) patch.titleBlocklist= titleBlocklist;
   if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
-  const feed = db.updateFeed(req.userId, req.params.id, patch);
+  if (url !== undefined) {
+    let newUrl = url.trim();
+    if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
+    let hostname;
+    try { hostname = new URL(newUrl).hostname; }
+    catch { return res.status(400).json({ error: 'Invalid feed URL' }); }
+    const ssrfError = await checkSsrfSafe(hostname);
+    if (ssrfError) return res.status(400).json({ error: ssrfError });
+    if (await db.feedUrlExists(req.userId, newUrl)) {
+      const existing = (await db.listFeeds(req.userId)).find(f => f.url === newUrl);
+      if (existing && existing.id !== req.params.id) return res.status(409).json({ error: 'Another feed already uses this URL.' });
+    }
+    patch.url = newUrl;
+    patch.isYoutube = newUrl.includes('youtube.com');
+  }
+  const feed = await db.updateFeed(req.userId, req.params.id, patch);
   if (!feed) return res.status(404).json({ error: 'Not found' });
+  // Changing the URL invalidates any cached content fetched under the old
+  // one — without this, the reader would keep showing old-feed content
+  // (or errors from it) until the cache TTL happens to expire on its own.
+  if (url !== undefined) await articleCache.delete(feed.url);
   // Bust the article cache when block rules change — see the matching
   // comment in src/main/index.js's feeds:updateRules handler for why this
   // matters (otherwise the element picker's verification step checks
   // stale, pre-rule cached content and always reports a false negative).
   if (cssSelectors !== undefined || htmlPatterns !== undefined) {
     const feedId = req.params.id;
-    for (const [url, entry] of articleCache.entries()) {
-      if (entry.feedId === feedId) articleCache.delete(url);
+    for (const [cacheUrl, entry] of await articleCache.entries()) {
+      if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
     }
   }
   res.json(feedRow(feed));
 });
-app.delete('/api/feeds/:id', (req, res) => {
-  db.removeFeed(req.userId, req.params.id);
+app.delete('/api/feeds/:id', async (req, res) => {
+  await db.removeFeed(req.userId, req.params.id);
   res.json({ ok: true });
 });
 
 // ─── Feed fetching ────────────────────────────────────────────────────────────
 app.post('/api/feeds/fetch-all', async (req, res) => {
-  const feeds = db.listFeeds(req.userId).map(feedRow);
+  const feeds = (await db.listFeeds(req.userId)).map(feedRow);
   const CONCURRENCY = 6;
   const results = new Array(feeds.length);
   let next = 0;
@@ -503,7 +518,7 @@ app.post('/api/feeds/fetch-all', async (req, res) => {
   res.json(results);
 });
 app.post('/api/feeds/:id/fetch', async (req, res) => {
-  const feed = db.findFeed(req.userId, req.params.id);
+  const feed = await db.findFeed(req.userId, req.params.id);
   if (!feed) return res.status(404).json({ error: 'Not found' });
   try { res.json({ ok: true, ...await fetchFeed(feedRow(feed), cookieJars) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
@@ -514,43 +529,43 @@ app.post('/api/article/fetch', async (req, res) => {
   const { url, feedId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  const ttl = articleTtlMs(req.userId);
-  const cached = articleCache.get(url);
+  const ttl = await articleTtlMs(req.userId);
+  const cached = await articleCache.get(url);
   if (cached && Date.now() - cached.ts < ttl) return res.json(cached.result);
 
-  const feed = feedId ? db.findFeed(req.userId, feedId) : null;
+  const feed = feedId ? await db.findFeed(req.userId, feedId) : null;
   const feedRowData = feed ? feedRow(feed) : null;
   if (feedRowData && !feedRowData.fetchStrategyOrder?.length) {
-    const globalOrder = db.getSettings(req.userId).fetchStrategyOrder;
+    const globalOrder = (await db.getSettings(req.userId)).fetchStrategyOrder;
     if (globalOrder?.length) feedRowData.fetchStrategyOrder = globalOrder;
   }
   try {
     const result = await fetchArticle(url, feedRowData, cookieJars, rssFallback);
-    articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
+    await articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
     res.json(result);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-app.post('/api/article/clear-cache', (req, res) => {
+app.post('/api/article/clear-cache', async (req, res) => {
   const { url } = req.body || {};
   if (url) {
-    articleCache.delete(url);
+    await articleCache.delete(url);
   } else {
-    for (const [key] of [...articleCache.entries()]) articleCache.delete(key);
+    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
   }
   res.json({ ok: true });
 });
 
 // ─── Article state ────────────────────────────────────────────────────────────
-app.get('/api/articles/state', (req, res) => res.json(db.getArticleState(req.userId)));
-app.post('/api/articles/mark-read', (req, res) => {
+app.get('/api/articles/state', async (req, res) => res.json(await db.getArticleState(req.userId)));
+app.post('/api/articles/mark-read', async (req, res) => {
   const { articleId, feedId } = req.body;
-  db.markRead(req.userId, `${feedId}:${articleId}`);
+  await db.markRead(req.userId, `${feedId}:${articleId}`);
   res.json({ ok: true });
 });
-app.post('/api/articles/toggle-star', (req, res) => {
+app.post('/api/articles/toggle-star', async (req, res) => {
   const { articleId, feedId, starred } = req.body;
-  db.toggleStar(req.userId, `${feedId}:${articleId}`, !!starred);
+  await db.toggleStar(req.userId, `${feedId}:${articleId}`, !!starred);
   res.json({ ok: true });
 });
 
@@ -649,28 +664,28 @@ function buildProxyShim(base) {
 }
 
 // ─── OPML ─────────────────────────────────────────────────────────────────────
-app.get('/api/opml/export', (req, res) => {
-  const feeds   = db.listFeeds(req.userId).map(feedRow);
-  const folders = db.listFolders(req.userId);
+app.get('/api/opml/export', async (req, res) => {
+  const feeds   = (await db.listFeeds(req.userId)).map(feedRow);
+  const folders = await db.listFolders(req.userId);
   const opml    = buildOpml(feeds, folders);
   const fn = `flux-feeds-${new Date().toISOString().slice(0,10)}.opml`;
   res.setHeader('Content-Type', 'application/xml; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${fn}"`);
   res.send(opml);
 });
-app.post('/api/opml/import', upload.single('file'), (req, res) => {
+app.post('/api/opml/import', upload.single('file'), async (req, res) => {
   const xml = req.file ? req.file.buffer.toString('utf8') : req.body.xml;
   if (!xml) return res.status(400).json({ error: 'No OPML data' });
   const { folders: of_, feeds: ofeeds } = parseOpml(xml);
   const folderMap = {};
-  for (const ef of db.listFolders(req.userId)) folderMap[ef.name] = ef.id;
+  for (const ef of await db.listFolders(req.userId)) folderMap[ef.name] = ef.id;
   for (const f of of_) {
-    if (!folderMap[f.name]) { const folder = db.addFolder(req.userId, f.name, f.icon || '◈'); folderMap[folder.name] = folder.id; }
+    if (!folderMap[f.name]) { const folder = await db.addFolder(req.userId, f.name, f.icon || '◈'); folderMap[folder.name] = folder.id; }
   }
   let imported = 0, skipped = 0;
   for (const f of ofeeds) {
-    if (db.feedUrlExists(req.userId, f.url)) { skipped++; continue; }
-    db.addFeed(req.userId, { name:f.name, url:f.url, folder:f.folderName?(folderMap[f.folderName]||null):null,
+    if (await db.feedUrlExists(req.userId, f.url)) { skipped++; continue; }
+    await db.addFeed(req.userId, { name:f.name, url:f.url, folder:f.folderName?(folderMap[f.folderName]||null):null,
       isYoutube:f.url.includes('youtube.com'), inlineBrowser:!!f.inlineBrowser, hideShorts:false,
       cssSelectors:f.cssSelectors||[], htmlPatterns:f.htmlPatterns||[], favicon:null });
     imported++;
@@ -679,16 +694,21 @@ app.post('/api/opml/import', upload.single('file'), (req, res) => {
 });
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
-app.get('/api/settings', (req, res) => res.json(db.getSettings(req.userId)));
-app.put('/api/settings', (req, res) => { db.setSettings(req.userId, req.body || {}); res.json({ ok: true }); });
+app.get('/api/settings', async (req, res) => res.json(await db.getSettings(req.userId)));
+app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); res.json({ ok: true }); });
 
 // ─── Ollama ───────────────────────────────────────────────────────────────────
 // ─── Ollama ───────────────────────────────────────────────────────────────────
 // The Electron app starts/stops Ollama from its main process via child_process.
-// The web server runs in plain Node too, so there's no fundamental reason it
-// can't do the same thing — it just wasn't wired up before, leaving the web
-// client's "auto-start Ollama" setting silently doing nothing (api.js stubbed
-// isRunning to always report true and start() to always fail).
+// A traditionally-hosted server (a VPS, your own machine) can do the same
+// thing — but a serverless platform like Vercel fundamentally can't:
+// functions there don't allow spawning long-running background processes,
+// and even if they did, each invocation is a fresh, isolated environment
+// with no relationship to the next one. IS_SERVERLESS gates the
+// process-spawning endpoint specifically; AI features themselves still
+// work fine under Supabase/Vercel as long as OLLAMA_URL points at an
+// Ollama instance running somewhere else that's reachable over HTTP.
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 let ollamaProcess   = null;  // the child_process we spawned, if any
 let weStartedOllama = false; // only stop it if we're the one who started it
 
@@ -710,8 +730,9 @@ app.get('/api/ollama/is-running', async (req, res) => {
   res.json({ running: await pingOllama(url) });
 });
 
-function requireAiEnabled(req, res, next) {
-  if (!db.getSystemSettings().aiFeaturesEnabled) {
+async function requireAiEnabled(req, res, next) {
+  const sys = await db.getSystemSettings();
+  if (!sys.aiFeaturesEnabled) {
     return res.status(403).json({ error: 'AI features are disabled on this server.' });
   }
   next();
@@ -719,13 +740,16 @@ function requireAiEnabled(req, res, next) {
 // Admin-configured Ollama URL/model (system settings) take precedence over
 // the env-var defaults, but a caller-supplied value (e.g. someone pointing
 // their own client at a personal Ollama instance) wins over both.
-function resolvedOllama(reqUrl, reqModel) {
-  const sys = db.getSystemSettings();
+async function resolvedOllama(reqUrl, reqModel) {
+  const sys = await db.getSystemSettings();
   return { url: reqUrl || sys.ollamaUrl || OLLAMA_URL, model: reqModel || sys.ollamaModel || OLLAMA_MODEL };
 }
 
 app.post('/api/ollama/start', requireAiEnabled, async (req, res) => {
-  const { url } = resolvedOllama(req.body?.url);
+  if (IS_SERVERLESS) {
+    return res.status(400).json({ ok: false, error: "Can't start Ollama from a serverless deployment (Vercel/Lambda) — there's no persistent process to keep it running. Run Ollama somewhere else (your own machine, a VPS) and point OLLAMA_URL / Admin Settings at it instead." });
+  }
+  const { url } = await resolvedOllama(req.body?.url);
   if (await pingOllama(url)) return res.json({ ok: true, alreadyRunning: true });
 
   if (ollamaProcess) return res.json({ ok: true, starting: true }); // a start is already in flight
@@ -783,8 +807,8 @@ app.post('/api/ollama/stop-if-started', async (req, res) => {
 app.post('/api/ollama/cluster', requireAiEnabled, async (req, res) => {
   const { articles, ollamaUrl, model, maxDaysApart, excludeSameSource } = req.body;
   if (!Array.isArray(articles)) return res.status(400).json({ error: 'articles array required' });
-  const s = db.getSettings(req.userId);
-  const { url, model: resolvedModel } = resolvedOllama(ollamaUrl, model);
+  const s = await db.getSettings(req.userId);
+  const { url, model: resolvedModel } = await resolvedOllama(ollamaUrl, model);
   const opts = {
     maxDaysApart:      maxDaysApart      !== undefined ? maxDaysApart      : (s.clusterMaxDaysApart ?? 3),
     excludeSameSource: excludeSameSource !== undefined ? excludeSameSource : (s.clusterExcludeSameSource !== false),
@@ -795,14 +819,14 @@ app.post('/api/ollama/cluster', requireAiEnabled, async (req, res) => {
 app.post('/api/ollama/summarize', requireAiEnabled, async (req, res) => {
   const { items, ollamaUrl, model } = req.body;
   if (!Array.isArray(items)) return res.status(400).json({ error: 'items array required' });
-  const { url, model: resolvedModel } = resolvedOllama(ollamaUrl, model || 'llama3.2');
+  const { url, model: resolvedModel } = await resolvedOllama(ollamaUrl, model || 'llama3.2');
   try { res.json({ summary: await ollamaSummarize(items, url, resolvedModel) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 app.post('/api/ollama/daily-digest', requireAiEnabled, async (req, res) => {
   const { articles, ollamaUrl, model } = req.body;
   if (!Array.isArray(articles)) return res.status(400).json({ error: 'articles array required' });
-  const { url, model: resolvedModel } = resolvedOllama(ollamaUrl, model || 'llama3.2');
+  const { url, model: resolvedModel } = await resolvedOllama(ollamaUrl, model || 'llama3.2');
   try { res.json({ digest: await ollamaDailyDigest(articles, url, resolvedModel) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -827,16 +851,34 @@ app.use((req, res, next) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-loadDeps().then(() => {
-  const ifaces = require('os').networkInterfaces();
-  const localIps = Object.values(ifaces).flat().filter(i => i.family === 'IPv4' && !i.internal).map(i => i.address);
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n  \x1b[1m\x1b[36mFlux web server\x1b[0m`);
-    console.log(`  \x1b[2mLocal:\x1b[0m   http://localhost:${PORT}`);
-    localIps.forEach(ip => console.log(`  \x1b[2mNetwork:\x1b[0m http://${ip}:${PORT}  ← mobile/other devices`));
-    console.log(`  \x1b[2mData:\x1b[0m    ${DB_PATH}`);
-    console.log(`  \x1b[2mOllama:\x1b[0m  ${OLLAMA_URL}`);
-    console.log(`\n  \x1b[33m⚠ No authentication — anyone on the same network can access this server.\x1b[0m`);
-    console.log(`  \x1b[2mRun behind a VPN or firewall if not on a trusted local network.\x1b[0m\n`);
-  });
-}).catch(e => { console.error('Failed to load deps:', e); process.exit(1); });
+// Under Vercel (or any serverless platform), the platform's runtime owns the
+// HTTP server and invokes the exported Express app per-request — calling
+// app.listen() ourselves would be both unnecessary and actively wrong there
+// (nothing would ever call it, or it could throw trying to bind a port that
+// isn't relevant in that model). See api/index.js, the Vercel entry point,
+// which does `module.exports = require('../server/index.js')`.
+if (IS_SERVERLESS) {
+  loadDeps().catch(e => console.error('Failed to load deps:', e));
+} else {
+  loadDeps().then(async () => {
+    const ifaces = require('os').networkInterfaces();
+    const localIps = Object.values(ifaces).flat().filter(i => i.family === 'IPv4' && !i.internal).map(i => i.address);
+    app.listen(PORT, '0.0.0.0', async () => {
+      console.log(`\n  \x1b[1m\x1b[36mFlux web server\x1b[0m`);
+      console.log(`  \x1b[2mLocal:\x1b[0m   http://localhost:${PORT}`);
+      localIps.forEach(ip => console.log(`  \x1b[2mNetwork:\x1b[0m http://${ip}:${PORT}  ← mobile/other devices`));
+      console.log(`  \x1b[2mData:\x1b[0m    ${process.env.SUPABASE_URL ? `Supabase (${process.env.SUPABASE_URL})` : DB_PATH}`);
+      console.log(`  \x1b[2mOllama:\x1b[0m  ${OLLAMA_URL}`);
+      if ((await db.userCount()) === 0) {
+        console.log(`\n  \x1b[33m⚠ No account exists yet — the first person to register becomes the admin.\x1b[0m`);
+      }
+      const sys = await db.getSystemSettings();
+      if (ALLOW_SIGNUP || sys.allowSignup) {
+        console.log(`  \x1b[33m⚠ Open signup is enabled — anyone who can reach this server can create an account.\x1b[0m`);
+      }
+      console.log('');
+    });
+  }).catch(e => { console.error('Failed to load deps:', e); process.exit(1); });
+}
+
+module.exports = app;
