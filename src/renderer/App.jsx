@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import * as api from './api.js';
+import { Analytics } from '@vercel/analytics/react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 // Import (not a bare string path) so Vite's bundler tracks this reference
 // and rewrites it to the correct hashed/copied path in dist/assets/ during
 // build — the same way it already rewrites the <link rel="icon"> tag in
@@ -3468,6 +3470,8 @@ export default function App() {
 
   if (isMobile) return <>
     <style>{GLOBAL_CSS}</style>
+    <Analytics />
+    <SpeedInsights />
     <MobileLayout
       feeds_={feeds_} folders_={folders_} articles={articles} visibleArticles={visibleArticles}
       activeView={activeView} setActiveView={setActiveView}
@@ -3495,6 +3499,8 @@ export default function App() {
 
   return <>
     <style>{GLOBAL_CSS}</style>
+    <Analytics />
+    <SpeedInsights />
     <div style={{ display:'flex', height:'100vh', overflow:'hidden' }}>
       <Sidebar folders={folders_} feeds={feeds_} articles={articles} activeView={activeView} onSelectView={(v)=>{ setActiveView(v); setArticleListCollapsed(false); }} onOpenAddFeed={(folder)=>setShowAddFeed(folder&&folder.id?folder:true)} onAddToFolder={(folder)=>setAddToFolderTarget(folder)} onRefreshAll={handleRefreshAll} refreshing={refreshing} onExportOPML={handleExportOPML} onImportOPML={handleImportOPML} onNewFolder={()=>setShowNewFolder(true)} onOpenSettings={()=>setShowSettings(true)} onFeedSettings={setRulesTarget} onRemoveFeed={handleRemoveFeed} onRemoveFolder={handleRemoveFolder} onManageFolderFeeds={setManageFolderTarget} newArticleCount={newArticleCount} settings={settings} onReorderFolders={handleReorderFolders} onEditFolder={setEditFolderTarget} />
       <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} />
