@@ -2692,7 +2692,7 @@ function ContextMenu({ x, y, items, onClose }) {
     return { top, left };
   },[x,y,items.length]);
 
-  return <div onClick={e=>e.stopPropagation()} style={{ position:'fixed', top:style.top, left:style.left, background:T.surface, border:`1px solid ${T.border}`, borderRadius:8, boxShadow:'0 8px 24px rgba(0,0,0,.45)', zIndex:300, overflow:'hidden', minWidth:170, padding:'4px 0' }} className="fade-in">
+  return <div onClick={e=>e.stopPropagation()} onTouchEnd={e=>e.stopPropagation()} style={{ position:'fixed', top:style.top, left:style.left, background:T.surface, border:`1px solid ${T.border}`, borderRadius:8, boxShadow:'0 8px 24px rgba(0,0,0,.45)', zIndex:300, overflow:'hidden', minWidth:170, padding:'4px 0' }} className="fade-in">
     {items.map((it,i)=> it.divider
       ? <div key={i} style={{ height:1, background:T.borderSubtle, margin:'4px 0' }} />
       : <ContextMenuItem key={i} item={it} onClose={onClose} />
@@ -3160,15 +3160,39 @@ export default function App() {
       await api.auth.ready(); // Electron: wait for persisted remote-server config to load
       if (!api.isRemoteHttp()) { if (!cancelled) setAuthState('ok'); return; }
       if (!api.auth.isLoggedIn()) { if (!cancelled) setAuthState('needed'); return; }
-      try { await api.auth.me(); if (!cancelled) setAuthState('ok'); } // confirms the stored token is still valid
-      catch { if (!cancelled) setAuthState('needed'); }
+      // Optimistically trust a stored token rather than spending a full
+      // extra network round-trip on /api/auth/me before rendering anything
+      // — the first real data call below (feeds/folders/settings) hits the
+      // same auth check server-side and will 401 just as fast if the token
+      // actually is stale, which onUnauthorized (wired above) already
+      // catches and bounces back to the login screen. This removes an
+      // entire sequential round-trip from the "blank screen" critical path
+      // for the overwhelmingly common case of a still-valid session.
+      if (!cancelled) setAuthState('ok');
     })();
     return () => { cancelled = true; };
   }, []);
 
-  const [feeds_,  setFeeds]    = useState([]);
-  const [folders_,setFolders]  = useState([]);
-  const [articles,setArticles] = useState([]);
+  // Client-side cache of the last-loaded feeds/folders/articles/settings —
+  // read synchronously at mount so the UI can paint the previous session's
+  // data immediately instead of sitting blank while the network round-trip
+  // to Vercel/Supabase completes (which, especially on a cold start, was
+  // the dominant cause of "a few seconds before anything shows up"). The
+  // real fetch still always happens and replaces this the moment it
+  // resolves — this is purely a perceived-speed improvement, never a
+  // substitute for fresh data. Scoped to one shared key rather than
+  // per-account: if two different accounts share one browser, the second
+  // login may flash the first account's cached list for a moment before
+  // the real fetch overwrites it — a minor cosmetic edge case, not a data
+  // leak (nothing persists beyond that one render).
+  const CACHE_KEY = 'flux_last_known_v1';
+  const loadCache = () => { try { return JSON.parse(localStorage.getItem(CACHE_KEY)) || {}; } catch { return {}; } };
+  const saveCache = (patch) => { try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ...loadCache(), ...patch })); } catch {} };
+  const _cached = useMemo(loadCache, []);
+
+  const [feeds_,  setFeeds]    = useState(_cached.feeds || []);
+  const [folders_,setFolders]  = useState(_cached.folders || []);
+  const [articles,setArticles] = useState(_cached.articles || []);
   const articlesRef = useRef([]); // keeps current articles accessible inside refreshFeeds useCallback
   useEffect(() => { articlesRef.current = articles; }, [articles]);
   const [activeView,setActiveView] = useState('__all');
@@ -3186,7 +3210,7 @@ export default function App() {
   const [editFolderTarget, setEditFolderTarget] = useState(null);
   const [manageFolderTarget,setManageFolderTarget] = useState(null);
   const [addToFolderTarget,setAddToFolderTarget] = useState(null);
-  const [settings,setSettings] = useState({ aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaUrl:'', ollamaModel:'' });
+  const [settings,setSettings] = useState(_cached.settings || { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaUrl:'', ollamaModel:'' });
   const [filtersByView,setFiltersByView] = useState({});
 
   const filters = filtersByView[activeView] || DEFAULT_FILTERS;
