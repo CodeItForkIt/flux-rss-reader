@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import * as api from './api.js';
 import { Analytics } from '@vercel/analytics/react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
+import { mergeArticlesWithState } from '../core/article-state';
 // Import (not a bare string path) so Vite's bundler tracks this reference
 // and rewrites it to the correct hashed/copied path in dist/assets/ during
 // build — the same way it already rewrites the <link rel="icon"> tag in
@@ -3233,25 +3234,7 @@ export default function App() {
 
         // Precompute a timestamp-keyed sorted array by converting dates once
         // instead of on every sort comparison (Date constructor is expensive).
-        const mergeInto = (existing, incoming) => {
-          // Merge + deduplicate by article id, preserving read/starred state
-          // from whichever copy is more "read". The incoming copy has state
-          // from the DB (readSet), but if the user marked it read in this
-          // session, the existing copy in React state has isRead:true even
-          // if the DB write hasn't settled yet. Take the union (true if either).
-          const map = new Map(existing.map(a => [a.id, a]));
-          for (const a of incoming) {
-            const prev = map.get(a.id);
-            map.set(a.id, prev ? {
-              ...a,
-              isRead:    prev.isRead    || a.isRead,
-              isStarred: prev.isStarred || a.isStarred,
-            } : a);
-          }
-          const arr = Array.from(map.values());
-          arr.sort((a, b) => (b._dateMs || 0) - (a._dateMs || 0));
-          return arr;
-        };
+        const mergeInto = (existing, incoming) => mergeArticlesWithState(existing, incoming, readSet, starSet);
 
         const unsub = api.feeds.onStreamResult((data) => {
           if (data.type === 'avatarUpdate') {
@@ -3289,12 +3272,7 @@ export default function App() {
         unsub(); // clean up listener
 
         // Final dedup pass in case of any last stragglers
-        setArticles(prev => {
-          const map = new Map(prev.map(a => [a.id, a]));
-          const arr = Array.from(map.values());
-          arr.sort((a, b) => (b._dateMs || 0) - (a._dateMs || 0));
-          return arr;
-        });
+        setArticles(prev => mergeArticlesWithState(prev, [], readSet, starSet));
 
       } else {
         // ── Batch path (web server) ───────────────────────────────────────
