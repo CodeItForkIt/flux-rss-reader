@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mergeArticlesWithState } = require('../src/core/article-state');
+const { mergeArticlesWithState } = require('../src/core/article-state.mjs');
 
 test('preserves optimistic read state when refresh replays an article as unread', () => {
   const existing = [{ id: 'a', feedId: 'f1', title: 'First', isRead: true, isStarred: false }];

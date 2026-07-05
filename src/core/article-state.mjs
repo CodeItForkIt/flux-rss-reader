@@ -1,6 +1,4 @@
-'use strict';
-
-function mergeArticlesWithState(existing, incoming, readSet = new Set(), starSet = new Set()) {
+export function mergeArticlesWithState(existing, incoming, readSet = new Set(), starSet = new Set()) {
   const map = new Map(existing.map(article => [article.id, article]));
 
   for (const article of incoming) {
@@ -22,5 +20,4 @@ function mergeArticlesWithState(existing, incoming, readSet = new Set(), starSet
   return merged;
 }
 
-module.exports = { mergeArticlesWithState };
-module.exports.default = module.exports;
+export default { mergeArticlesWithState };
