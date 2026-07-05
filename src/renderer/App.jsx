@@ -3294,8 +3294,7 @@ export default function App() {
           isRead:    readSet.has(`${item.feedId}:${item.id}`),
           isStarred: starSet.has(`${item.feedId}:${item.id}`),
         })));
-        allItems.sort((a, b) => (b._dateMs || 0) - (a._dateMs || 0));
-        setArticles(allItems);
+        setArticles(articleState.mergeArticlesWithState(articlesRef.current, allItems, readSet, starSet));
       }
 
       // AI clustering — opt-in only, runs after articles are visible
