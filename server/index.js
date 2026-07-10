@@ -80,6 +80,28 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || '').split(',').map(s => s.tr
 // by default, while still supporting more than one person.
 const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP === 'true';
 
+// Detected here (not just further down) because it gates which store gets
+// created, immediately below. A serverless platform gives each request its
+// own short-lived, non-shared environment — there is no "the same disk"
+// between one invocation and the next, let alone between two different
+// devices' requests. Writing session tokens, read/starred state, or
+// anything else to a local JSON file in that model means every write is
+// either lost immediately or only visible to whichever warm instance
+// happens to still be around, which is exactly the "logged in, but the very
+// next request says my session expired," "read status doesn't stick," and
+// "changes only sync sometimes" symptoms — not really a bug in the app
+// logic, but a store that fundamentally cannot work in this environment.
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+if (IS_SERVERLESS && !(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)) {
+  console.error('\x1b[31m✗ Running on a serverless platform (Vercel/Lambda) without Supabase configured.\x1b[0m');
+  console.error('  The local JSON-file store cannot persist data here — every request may run in a');
+  console.error('  fresh, unshared environment, so sessions, read state, and settings will appear');
+  console.error('  to randomly reset or fail to sync between devices.');
+  console.error('  Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (see server/supabase-schema.sql');
+  console.error('  and .env.example) and redeploy.');
+  throw new Error('Refusing to start: serverless deployment requires Supabase (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY) — see server/supabase-schema.sql');
+}
+
 const db = createStore(DB_PATH);
 
 // Single-user stub — all operations use userId = 1
@@ -725,17 +747,16 @@ app.get('/api/settings', async (req, res) => res.json(await db.getSettings(req.u
 app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); res.json({ ok: true }); });
 
 // ─── Ollama ───────────────────────────────────────────────────────────────────
-// ─── Ollama ───────────────────────────────────────────────────────────────────
 // The Electron app starts/stops Ollama from its main process via child_process.
 // A traditionally-hosted server (a VPS, your own machine) can do the same
 // thing — but a serverless platform like Vercel fundamentally can't:
 // functions there don't allow spawning long-running background processes,
 // and even if they did, each invocation is a fresh, isolated environment
-// with no relationship to the next one. IS_SERVERLESS gates the
+// with no relationship to the next one. IS_SERVERLESS (declared earlier,
+// where it also gates which store gets created) is reused here to gate the
 // process-spawning endpoint specifically; AI features themselves still
 // work fine under Supabase/Vercel as long as OLLAMA_URL points at an
 // Ollama instance running somewhere else that's reachable over HTTP.
-const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 let ollamaProcess   = null;  // the child_process we spawned, if any
 let weStartedOllama = false; // only stop it if we're the one who started it
 
