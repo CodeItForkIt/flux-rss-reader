@@ -122,11 +122,32 @@ const articleCache = {
   delete: (url) => db.cacheDelete(url),
   entries: () => db.cacheEntries(),
 };
+
+// getSettings() is called on nearly every article-fetch request just to
+// look up articleCacheDays/fetchStrategyOrder — that's a full Supabase
+// round-trip before the actual cache lookup even starts, on every single
+// request, cached or not. Settings change rarely, so a short in-memory
+// cache (per warm serverless instance) removes that round-trip for the
+// common case of a user opening several articles in quick succession,
+// without meaningfully risking staleness (worst case: a settings change
+// takes up to SETTINGS_CACHE_MS to take effect on this particular warm
+// instance — other instances/requests are unaffected).
+const SETTINGS_CACHE_MS = 30 * 1000;
+const _settingsCache = new Map(); // userId -> { ts, data }
+async function getSettingsCached(userId) {
+  const hit = _settingsCache.get(userId);
+  if (hit && Date.now() - hit.ts < SETTINGS_CACHE_MS) return hit.data;
+  const data = await db.getSettings(userId);
+  _settingsCache.set(userId, { ts: Date.now(), data });
+  return data;
+}
+function invalidateSettingsCache(userId) { _settingsCache.delete(userId); }
+
 async function articleTtlMs(userId) {
   // No request context at startup (userId undefined) — use the 7-day
   // default rather than any specific user's setting, since this pass is
   // just a size-bounding optimization, not a per-request correctness check.
-  const days = userId != null ? ((await db.getSettings(userId)).articleCacheDays ?? 7) : 7;
+  const days = userId != null ? ((await getSettingsCached(userId)).articleCacheDays ?? 7) : 7;
   return days * 24 * 60 * 60 * 1000;
 }
 // Prune expired entries on startup to keep the cache from growing
@@ -140,6 +161,47 @@ async function articleTtlMs(userId) {
     }
   } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
 })();
+
+// ─── Feed content cache ──────────────────────────────────────────────────────
+// There was previously NO caching at the feed level at all — every single
+// "refresh" (including just reloading the page, since the client
+// unconditionally refetches everything on mount) re-downloaded and
+// re-parsed every subscribed feed's XML from its origin, every time. On
+// Vercel that's the dominant cause of "reloading the page takes a few
+// seconds before articles show up" — there's no persistent local cache to
+// fall back on between requests the way there would be on a
+// long-running server.
+//
+// This reuses the same generic KV store as the article cache (distinct key
+// prefix to avoid collisions with real article URLs), keyed per-user-per-feed
+// rather than globally by URL — two different users subscribed to the same
+// blog will each still fetch it independently, but that trade-off keeps this
+// simple and unambiguously safe: a cached result's items bake in the
+// requesting feed's own local ID (see fetchFeed in core/fetcher.js), so
+// sharing a cache entry across two users' differently-ID'd feed rows would
+// require remapping every article ID before returning it — not worth the
+// complexity for what's fundamentally a "don't redo identical work you just
+// did 30 seconds ago" optimization, not a cross-user dedup feature.
+//
+// TTL is intentionally short: long enough that a page reload moments after
+// the last load is instant, short enough that it never feels "behind" —
+// this is not a substitute for the explicit Refresh action or the
+// auto-refresh timer, both of which pass force:true to bypass it entirely.
+const FEED_CACHE_TTL_MS = 3 * 60 * 1000;
+const feedCacheKey = (userId, feedId) => `flux-feed-cache::${userId}::${feedId}`;
+async function fetchFeedCached(userId, feed, cookieJars, force) {
+  const key = feedCacheKey(userId, feed.id);
+  if (!force) {
+    try {
+      const cached = await articleCache.get(key);
+      if (cached && Date.now() - cached.ts < FEED_CACHE_TTL_MS) return cached.result;
+    } catch (e) { console.warn('[feed-cache] read failed, falling back to live fetch:', e.message); }
+  }
+  const result = await fetchFeed(feed, cookieJars);
+  articleCache.set(key, { ts: Date.now(), feedId: null, result }).catch(e =>
+    console.warn('[feed-cache] write failed (non-fatal — this feed just won\'t be cached this round):', e.message));
+  return result;
+}
 
 // ─── SSRF guard ───────────────────────────────────────────────────────────────
 // /api/proxy, /api/feeds/resolve, and article/feed fetching all cause THIS
@@ -549,7 +611,13 @@ app.delete('/api/feeds/:id', async (req, res) => {
 });
 
 // ─── Feed fetching ────────────────────────────────────────────────────────────
+// force:true (sent by the explicit Refresh button, pull-to-refresh, and the
+// auto-refresh timer) bypasses the feed cache so those actions always hit
+// the network. Plain page-load/mount refreshes don't set it, so a reload
+// moments after the last one is served from cache instead of re-fetching
+// every single feed's XML from its origin again.
 app.post('/api/feeds/fetch-all', async (req, res) => {
+  const force = !!req.body?.force;
   const feeds = (await db.listFeeds(req.userId)).map(feedRow);
   const CONCURRENCY = 6;
   const results = new Array(feeds.length);
@@ -557,7 +625,7 @@ app.post('/api/feeds/fetch-all', async (req, res) => {
   await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
     while (next < feeds.length) {
       const i = next++;
-      try { results[i] = { ok: true, ...await fetchFeed(feeds[i], cookieJars) }; }
+      try { results[i] = { ok: true, ...await fetchFeedCached(req.userId, feeds[i], cookieJars, force) }; }
       catch (e) { results[i] = { ok: false, feedId: feeds[i].id, error: e.message }; }
     }
   }));
@@ -566,7 +634,7 @@ app.post('/api/feeds/fetch-all', async (req, res) => {
 app.post('/api/feeds/:id/fetch', async (req, res) => {
   const feed = await db.findFeed(req.userId, req.params.id);
   if (!feed) return res.status(404).json({ error: 'Not found' });
-  try { res.json({ ok: true, ...await fetchFeed(feedRow(feed), cookieJars) }); }
+  try { res.json({ ok: true, ...await fetchFeedCached(req.userId, feedRow(feed), cookieJars, !!req.body?.force) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 

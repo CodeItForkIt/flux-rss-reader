@@ -104,41 +104,62 @@ async function fetchWithCookies(url, opts = {}, cookieJars) {
   return resp;
 }
 
+// Bare _fetch() calls (archive.ph and googlebot-ua below) previously had NO
+// timeout at all — unlike fetchWithCookies, which has always aborted at
+// 15s. A hung connection to either host could stall an article-open
+// indefinitely. This gives any fetch the same abort-based timeout.
+async function withTimeout(url, opts, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await _fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Paywall bypass chain ─────────────────────────────────────────────────────
 // Each strategy: { name, minLength, run(url, cookieJars) -> html|null }
 // Exported so Settings/FeedRules UI can list available strategies by name.
+//
+// Per-strategy timeouts are staggered and shrink down the fallback chain:
+// 'direct' is the common case and gets the most patience, while later
+// strategies are already a degraded fallback path, so a slow one shouldn't
+// eat as much of the budget. Worst case (all four fail slowly) is bounded
+// to ~26s, leaving headroom under Vercel's 30s function maxDuration for
+// the readability/cheerio pass that runs afterward.
 const FETCH_STRATEGIES = {
   direct: {
     minLength: 5000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(url, {}, cookieJars);
+      const resp = await fetchWithCookies(url, { timeoutMs: 9000 }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   '12ft.io': {
     minLength: 3000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, {}, cookieJars);
+      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, { timeoutMs: 6000 }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   'archive.ph': {
     minLength: 3000,
     run: async (url) => {
-      const resp = await _fetch(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' });
+      const resp = await withTimeout(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' }, 6000);
       return resp.ok ? await resp.text() : null;
     },
   },
   'googlebot-ua': {
     minLength: 5000,
     run: async (url) => {
-      const resp = await _fetch(url, {
+      const resp = await withTimeout(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
         redirect: 'follow',
-      });
+      }, 5000);
       return resp.ok ? await resp.text() : null;
     },
   },
@@ -157,7 +178,7 @@ async function fetchArticleHtml(url, cookieJars, order) {
     try {
       const html = await strategy.run(url, cookieJars);
       if (html && html.length > strategy.minLength) return { html, source: name };
-    } catch (e) { console.warn(`[fetch/${name}]`, e.message); }
+    } catch (e) { console.warn(`[fetch/${name}]`, e.name === 'AbortError' ? 'timed out' : e.message); }
   }
 
   throw new Error('All fetch strategies exhausted for: ' + url);

@@ -745,83 +745,59 @@ function GroupView({ group, feeds, settings, onOpenMember }) {
     </div>
   );
 }
-function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }) {
-  const [history, setHistory] = useState([url]);
-  const [idx, setIdx]         = useState(0);
-  const [title, setTitle]     = useState(null);
+function InlineBrowser({ url, onClose, onNavigateArticle, isMobile }) {
   const [loading, setLoading] = useState(true);
-  const [canGoBack, setCanGoBack]       = useState(false);
-  const [canGoForward, setCanGoForward] = useState(false);
   const webviewRef = useRef(null);
   const iframeRef  = useRef(null);
-  const current    = history[idx];
 
   // Web mode: proxy through the backend so X-Frame-Options/CSP headers that
   // would otherwise block framing are stripped server-side.
   const proxiedSrc = useMemo(() => {
-    const params = new URLSearchParams({ url: current });
+    const params = new URLSearchParams({ url });
     const token = api.getAuthToken();
     if (token) params.set('token', token);
     return `/api/proxy?${params.toString()}`;
-  }, [current]);
-
-  const pushHistory = useCallback((newUrl) => {
-    if (!newUrl || newUrl === 'about:blank') return;
-    setHistory(h => {
-      if (h[idx] === newUrl) return h; // no-op, already here
-      return [...h.slice(0, idx+1), newUrl];
-    });
-    setIdx(i => i+1);
-  }, [idx]);
+  }, [url]);
 
   // ── Electron: <webview> wiring ────────────────────────────────────────────
+  // No address bar, no history stack — this shows exactly one page (the
+  // article's own URL). Any navigation away from it, from anywhere on the
+  // page, hands off to the system browser instead of following it here.
+  //
+  // Note: this is a renderer-side approximation. True prevention (never
+  // letting the guest page's navigation start at all) needs a main-process
+  // `will-navigate` handler on the webview's webContents, which isn't
+  // wired up here — this instead lets the navigation happen, immediately
+  // cancels/snaps back to the original URL, and opens the destination
+  // externally. There's a brief flash of the followed page rather than it
+  // never rendering at all, but it never stays inline.
   useEffect(() => {
     if (!api.isElectron) return;
     const wv = webviewRef.current;
     if (!wv) return;
 
     const onStartLoading = () => setLoading(true);
-    const onStopLoading  = () => {
-      setLoading(false);
-      try {
-        setCanGoBack(wv.canGoBack());
-        setCanGoForward(wv.canGoForward());
-      } catch {}
+    const onStopLoading  = () => setLoading(false);
+    const redirectAway = (newUrl) => {
+      if (!newUrl || newUrl === url) return;
+      try { wv.stop(); } catch {}
+      api.openExternal(newUrl);
+      try { wv.loadURL(url); } catch {}
     };
-    const onNavigate = (e) => {
-      const newUrl = e.url;
-      if (newUrl && newUrl !== current) pushHistory(newUrl);
-      // Update back/forward availability immediately on navigation, not
-      // just on stop-loading — makes buttons update in real-time.
-      try { setCanGoBack(wv.canGoBack()); setCanGoForward(wv.canGoForward()); } catch {}
-    };
-    const onTitleUpdated = (e) => setTitle(e.title);
-    const onFailLoad = (e) => {
-      // -3 is ERR_ABORTED, common on redirects — ignore
-      if (e.errorCode === -3) return;
-      setLoading(false);
-    };
+    const onNavigate = (e) => redirectAway(e.url);
 
     wv.addEventListener('did-start-loading', onStartLoading);
     wv.addEventListener('did-stop-loading', onStopLoading);
     wv.addEventListener('did-navigate', onNavigate);
     wv.addEventListener('did-navigate-in-page', onNavigate);
-    wv.addEventListener('page-title-updated', onTitleUpdated);
-    wv.addEventListener('did-fail-load', onFailLoad);
 
     // Keyboard shortcuts inside the embedded page don't bubble to our
     // window — <webview> content runs in a separate guest page. Forward
-    // a small set of navigation shortcuts via before-input-event so you're
-    // never "trapped" with no way to move between articles.
-    //   Alt+← / Alt+→  → previous/next article (Alt avoids clobbering
-    //                     normal arrow-key use in the embedded page, e.g.
-    //                     text fields, video seeking, carousels)
-    //   Escape          → step back through followed-link history
+    // Alt+←/→ for article navigation so you're never "trapped" in here.
     const onBeforeInput = (e) => {
       if (e.type !== 'keyDown') return;
       if (e.alt && e.key === 'ArrowLeft')  onNavigateArticle?.(-1);
       else if (e.alt && e.key === 'ArrowRight') onNavigateArticle?.(1);
-      else if (e.key === 'Escape') onStepBack?.();
     };
     wv.addEventListener('before-input-event', onBeforeInput);
 
@@ -830,120 +806,66 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
       wv.removeEventListener('did-stop-loading', onStopLoading);
       wv.removeEventListener('did-navigate', onNavigate);
       wv.removeEventListener('did-navigate-in-page', onNavigate);
-      wv.removeEventListener('page-title-updated', onTitleUpdated);
-      wv.removeEventListener('did-fail-load', onFailLoad);
       wv.removeEventListener('before-input-event', onBeforeInput);
     };
-  }, [pushHistory, onNavigateArticle, onStepBack]); // intentionally omits 'current' — listener setup runs once per mount
+  }, [url, onNavigateArticle]);
 
-  // Electron: target=_blank / window.open() inside the page → navigate
-  // the webview itself instead of spawning a new Electron window.
+  // Electron: target=_blank / window.open() inside the page → open
+  // externally instead of spawning a new Electron window.
   useEffect(() => {
     if (!api.isElectron) return;
-    return api.webview.onNewWindow((newUrl) => {
-      pushHistory(newUrl);
-      webviewRef.current?.loadURL(newUrl);
-    });
-  }, [pushHistory]);
+    return api.webview.onNewWindow((newUrl) => { if (newUrl) api.openExternal(newUrl); });
+  }, []);
 
-  // Load the current URL into the webview whenever it changes via our own
-  // back/forward buttons (in-page navigation already updates history directly).
+  // Web mode: the injected proxy shim (see buildProxyShim in
+  // server/index.js) intercepts link clicks inside the framed page and
+  // posts a message up here instead of navigating the iframe.
   useEffect(() => {
-    if (!api.isElectron) return;
-    const wv = webviewRef.current;
-    if (!wv) return;
-    try { if (wv.getURL?.() === current) return; } catch {}
-    try { wv.loadURL?.(current); } catch {}
-  }, [current]);
-
-  const navigate = (dir) => {
-    if (api.isElectron) {
-      const wv = webviewRef.current;
-      try {
-        if (dir < 0 && wv?.canGoBack?.()) wv.goBack();
-        else if (dir > 0 && wv?.canGoForward?.()) wv.goForward();
-      } catch {}
-      return;
-    }
-    setIdx(i => Math.max(0, Math.min(history.length-1, i+dir)));
-  };
+    if (api.isElectron) return;
+    const onMessage = (e) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.type === 'flux-proxy-link-click' && e.data.url) api.openExternal(e.data.url);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   const reload = () => {
     if (api.isElectron) { try { webviewRef.current?.reload?.(); } catch {} }
     else if (iframeRef.current) iframeRef.current.src = iframeRef.current.src;
   };
 
-  const handleCopyCurrentUrl = useCallback(async () => {
-    if (!current || current === 'about:blank') return;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(current);
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = current; ta.style.position = 'fixed'; ta.style.opacity = '0';
-        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-      }
-    } catch {}
-  }, [current]);
-
-  // Web-mode iframe: detect in-page navigation where possible (same-origin
-  // only — cross-origin loads can't be introspected, so back/forward there
-  // just replays our own history stack).
-  const handleIframeLoad = () => {
-    setLoading(false);
-    try {
-      const loc = iframeRef.current?.contentWindow?.location?.href;
-      if (!loc || loc === 'about:blank') return;
-
-      const proxiedHref = new URL(proxiedSrc, window.location.href).href;
-      const parsedLoc = new URL(loc);
-      if (parsedLoc.origin === window.location.origin && parsedLoc.pathname === '/api/proxy') return;
-      if (loc !== proxiedHref && !loc.startsWith(proxiedHref)) pushHistory(loc);
-    } catch {} // cross-origin — expected, ignore
-  };
-
-  const backDisabled    = api.isElectron ? !canGoBack    : idx === 0;
-  const forwardDisabled = api.isElectron ? !canGoForward : idx === history.length-1;
-
   return (
     <div style={{ position:'absolute', inset:0, zIndex:30, background:T.bg, display:'flex', flexDirection:'column' }}>
-      {/* Browser chrome */}
+      {/* Minimal chrome — no address bar or navigation history. This view
+          only ever shows the one article URL; every link on it exits to
+          the system browser rather than navigating here. */}
       <div style={{ padding: isMobile?'10px 12px':'8px 12px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, background:T.surface, flexShrink:0, paddingTop: isMobile?'calc(10px + env(safe-area-inset-top))':8 }}>
-        <IconBtn icon="←" title="Back" onClick={()=>navigate(-1)} disabled={backDisabled} size={isMobile?36:28} />
-        <IconBtn icon="→" title="Forward" onClick={()=>navigate(1)} disabled={forwardDisabled} size={isMobile?36:28} />
         <IconBtn icon="↺" title="Reload" onClick={reload} size={isMobile?36:28} />
         {loading && <Spinner size={13} />}
         <div style={{ flex:1 }} />
-        {!isMobile && <><Divider vertical margin={4} /><IconBtn icon="⧉" title="Copy current URL" onClick={handleCopyCurrentUrl} size={isMobile?36:28} /></>}
-        <Divider vertical margin={4} />
-        <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(current)} size={isMobile?36:28} />
+        <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(url)} size={isMobile?36:28} />
         {!isMobile && <><Divider vertical margin={4} /><Btn small variant="outline" onClick={onClose}>✕ Close</Btn></>}
         {isMobile && <IconBtn icon="✕" title="Close" onClick={onClose} size={36} />}
       </div>
 
       {api.isElectron ? (
         <>
-          <webview
-            ref={webviewRef}
-            src={current}
-            style={{ flex:1, display:'flex' }}
-            allowpopups="true"
-          />
+          <webview ref={webviewRef} src={url} style={{ flex:1, display:'flex' }} allowpopups="true" />
           {!isMobile && (
             <div style={{ padding:'4px 12px', fontSize:11, color:T.textSubtle, background:T.surface, borderTop:`1px solid ${T.borderSubtle}`, flexShrink:0 }}>
-              Alt+← / Alt+→ switches articles · Escape steps back through followed links
+              Links open in your default browser · Alt+← / Alt+→ switches articles
             </div>
           )}
           {isMobile && <div style={{ flexShrink:0, height:'calc(52px + env(safe-area-inset-bottom))' }} />}
         </>
       ) : (
         <>
-          {current ? (
+          {url ? (
             <iframe
-              key={current}
               ref={iframeRef}
               src={proxiedSrc}
-              onLoad={handleIframeLoad}
+              onLoad={()=>setLoading(false)}
               // NOTE: deliberately does NOT include allow-same-origin. This
               // iframe's document is served from OUR OWN origin (/api/proxy),
               // just displaying a rewritten copy of someone else's page —
@@ -955,10 +877,20 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
               // being blocked as cross-origin. The opaque sandboxed origin
               // this omission produces is what actually protects the app;
               // some sites may behave slightly worse (e.g. code that
-              // assumes persistent per-origin storage) as a result — that's
-              // an acceptable trade for not exposing the whole account to
-              // any page a feed happens to link to.
-              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
+              // assumes persistent per-origin storage, or client-side
+              // theme preferences stored via localStorage/cookies — a
+              // known symptom is a page falling back to its default light
+              // theme regardless of the site's own dark-mode setting)
+              // as a result. That's an acceptable trade for not exposing
+              // the whole account to any page a feed happens to link to;
+              // for JS-heavy sites that lean on that kind of storage, use
+              // "Open in default browser" instead of viewing inline.
+              //
+              // allow-top-navigation-by-user-activation was also removed:
+              // the shim below intercepts link clicks and hands them to
+              // the system browser instead, so the iframe itself no longer
+              // needs permission to navigate the top-level page at all.
+              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock"
               style={{ flex:1, border:'none', background:'#fff' }}
               title="Inline browser"
             />
@@ -967,7 +899,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
           )}
           {!isMobile && (
             <div style={{ padding:'4px 12px', fontSize:11, color:T.textSubtle, background:T.surface, borderTop:`1px solid ${T.borderSubtle}`, flexShrink:0 }}>
-              Some sites block embedding entirely — if the page is blank, use ↗ to open it in a real browser tab.
+              Links open in your default browser · some sites block embedding entirely — if blank, use ↗
             </div>
           )}
           {isMobile && <div style={{ flexShrink:0, height:'calc(52px + env(safe-area-inset-bottom))' }} />}
@@ -1014,21 +946,53 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     if (readerScrollRef.current) readerScrollRef.current.scrollTop = 0;
     if (!article || article.isGroup) return;
 
-    // Mark read after a brief view delay, regardless of article type or
-    // whether it opens in the inline browser — previously this only
-    // happened on the Readability-fetch path, so inline-browser and
-    // YouTube articles never got marked read.
-    const markReadTimer = setTimeout(()=>onMarkRead(article.id, article.feedId), 1200);
-
-    if (article.isYoutube) return ()=>clearTimeout(markReadTimer);
+    if (article.isYoutube) return;
 
     // If feed uses inline browser, show that by default
-    if (feed?.inlineBrowser) { setInlineBrow(true); setBrowUrl(article.link); return ()=>clearTimeout(markReadTimer); }
+    if (feed?.inlineBrowser) { setInlineBrow(true); setBrowUrl(article.link); return; }
 
     loadArticleContent(article);
-
-    return ()=>clearTimeout(markReadTimer);
   },[article?.id]);
+
+  // Mark read on LEAVE, not on open — this effect's cleanup fires exactly
+  // when `article` changes (navigating to a different one) or the reader
+  // pane unmounts (closing it, switching views), which is precisely
+  // "leaving the article". Deliberately a separate effect from the one
+  // above: that one resets per-article UI state and kicks off content
+  // loading, which have nothing to do with read-tracking, and coupling
+  // them previously meant every article got marked read ~1.2s after
+  // opening regardless of whether you actually read it or immediately
+  // navigated past it.
+  useEffect(()=>{
+    if (!article || article.isGroup) return;
+    const id = article.id, feedId = article.feedId;
+    return () => { onMarkRead(id, feedId); };
+  },[article?.id, onMarkRead]);
+
+  // Closing the tab/window skips the cleanup above in some browsers (the
+  // page can be torn down before a fire-and-forget effect cleanup's async
+  // work is scheduled). `pagehide` fires reliably in that case, and
+  // sendBeacon queues the request to survive the page unloading — it
+  // rides on the session cookie (set alongside the bearer token at
+  // login/register) since sendBeacon can't set an Authorization header.
+  // Only applies to the plain web build. Electron's local IPC mode has no
+  // HTTP endpoint for this to hit, and Electron's *remote* HTTP mode would
+  // need an absolute base URL (not just this relative path) — both rely on
+  // the ordinary cleanup-based mark-read above instead, which is already
+  // correct there; this is purely an extra safety net for the tab-close
+  // case, which is specifically a web-tab concept.
+  useEffect(()=>{
+    if (api.isElectron) return;
+    if (!article || article.isGroup || article.isYoutube) return;
+    const flush = () => {
+      try {
+        navigator.sendBeacon?.('/api/articles/mark-read',
+          new Blob([JSON.stringify({ articleId: article.id, feedId: article.feedId })], { type: 'application/json' }));
+      } catch {}
+    };
+    window.addEventListener('pagehide', flush);
+    return () => window.removeEventListener('pagehide', flush);
+  },[article?.id, article?.feedId]);
 
   // Pulled out of the effect above so the manual inline-browser toggle can
   // also trigger it. Previously, switching a feed's default to inline
@@ -1334,14 +1298,23 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     }
   },[article, content, feed, settings, runWithOllama]);
 
-  const handleCommitRule = useCallback(({selector, mode})=>{
+  const handleCommitRule = useCallback(async ({selector, mode})=>{
     if (!feed) return;
     const updated = {
       feedId: feed.id,
       cssSelectors: [...(feed.cssSelectors||[]), ...(mode==='block'||mode==='hide'?[selector]:[])],
       htmlPatterns: feed.htmlPatterns||[],
     };
-    onSaveRule(updated);
+    // MUST be awaited before re-fetching below: onSaveRule's PATCH request
+    // is what busts the server-side article-content cache for this feed's
+    // articles (see server/index.js's /api/feeds/:id handler). Previously
+    // this fired without awaiting, racing against the re-fetch call right
+    // after it — since the re-fetch is a simpler/faster request, it almost
+    // always won the race and read the still-cached pre-rule content,
+    // making the element picker look like it silently did nothing every
+    // single time (you can only reach the picker after already having
+    // viewed — and thus cached — the article you're picking from).
+    await onSaveRule(updated);
     setPickMode(false);
     setRuleWarning(null);
     // Re-fetch content with new rules
@@ -3415,14 +3388,38 @@ export default function App() {
     setFeeds(prev=>prev.map(f=>f.id===feedId?{...f,folder:folderId}:f));
   };
 
+  // Both of these previously called their persistence request with a bare
+  // `await` and no try/catch. The optimistic setArticles() call above it
+  // already made the article look read/starred in the UI, so if the
+  // network call then silently rejected (a transient blip, a cold-start
+  // timing hiccup, anything), there was no visible symptom at all *in this
+  // session* — but the state was never actually written server-side, so it
+  // reverted the moment the app was reloaded. That silent-failure gap is
+  // the most likely explanation for "read state doesn't persist": not a
+  // logic bug in how state is restored, but persistence calls occasionally
+  // failing with nothing catching or retrying them. One retry after a
+  // short delay covers the common transient case; a final failure now at
+  // least surfaces as a toast instead of vanishing outright.
+  const persistWithRetry = useCallback(async (fn, label) => {
+    try { await fn(); return; } catch {}
+    await new Promise(r => setTimeout(r, 800));
+    try { await fn(); }
+    catch (e) {
+      // Note: no app-level toast surface exists here (the one toast state
+      // in this file is scoped to ReaderPane, a different component) — if
+      // this warrants a visible UI notice later, wire a toast up at the
+      // App level rather than reaching into ReaderPane's local state.
+      console.warn(`[flux] failed to persist ${label} after retry — it may revert on reload:`, e);
+    }
+  },[]);
   const handleMarkRead = useCallback(async(articleId, feedId)=>{
     setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isRead:true}:a));
-    await api.articles.markRead({articleId, feedId});
-  },[]);
+    await persistWithRetry(() => api.articles.markRead({articleId, feedId}), 'read state');
+  },[persistWithRetry]);
   const handleToggleStar  = useCallback(async(articleId, feedId, starred)=>{
     setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isStarred:starred}:a));
-    await api.articles.toggleStar({articleId, feedId, starred});
-  },[]);
+    await persistWithRetry(() => api.articles.toggleStar({articleId, feedId, starred}), 'starred state');
+  },[persistWithRetry]);
   const handleSaveRules   = async(rules)=>{
     await api.feeds.updateRules(rules);
     setFeeds(prev=>prev.map(f=>f.id===rules.feedId?{...f,...rules}:f));
