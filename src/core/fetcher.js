@@ -228,23 +228,65 @@ function extractLeadImage($) {
   );
 }
 
+// Walks up from a just-removed element's former parent, removing ancestors
+// that are now empty as a direct result of that removal — bounded to the
+// removed element's own ancestry, not a sweep of the whole document. A
+// blanket sweep would also catch elements that were already empty for
+// unrelated reasons (many real pages have empty <span>/<div> elements used
+// purely as CSS/JS hooks), which risks stripping page structure a rule had
+// nothing to do with — especially in the early applyBlockRules pass, which
+// runs on the raw page before Readability has even parsed it.
+function pruneNowEmptyAncestors($, parentEl) {
+  let $p = $(parentEl);
+  while ($p.length && $p.children().length === 0 && !$p.text().trim() &&
+         $p.find('img,video,iframe,svg,picture,audio').length === 0) {
+    const $next = $p.parent();
+    $p.remove();
+    $p = $next;
+  }
+}
+
 function applyBlockRules(html, feedRules) {
   if (!feedRules || (!feedRules.cssSelectors?.length && !feedRules.htmlPatterns?.length)) return html;
   const $ = _cheerio.load(html);
 
   if (feedRules.cssSelectors?.length) {
-    try { $(feedRules.cssSelectors.join(', ')).remove(); } catch {}
+    // Applied one at a time rather than $(selectors.join(', ')) as a
+    // single call. cheerio's selector engine (css-select) supports less
+    // CSS than a real browser does — no pseudo-elements, for instance —
+    // and the selectors here were built by walking a real browser's DOM
+    // (see buildSelector in App.jsx), so they're only ever guaranteed
+    // valid *there*, not necessarily here. With one combined selector
+    // string, a single selector css-select can't parse throws and (since
+    // this was wrapped in one try/catch) silently kills removal for every
+    // *other* selector too — including a brand-new one just picked,
+    // making the element picker look completely broken for anything you
+    // pick from then on, even though the actual problem is one unrelated
+    // selector saved earlier. Isolating each one means a bad selector only
+    // ever affects itself.
+    for (const sel of feedRules.cssSelectors) {
+      try {
+        const $matched = $(sel);
+        const parents = $matched.map((_, el) => $(el).parent()[0]).get();
+        $matched.remove();
+        for (const p of parents) pruneNowEmptyAncestors($, p);
+      } catch (e) { console.warn('[block-rule] selector failed, skipping just this one:', sel, e.message); }
+    }
   }
   if (feedRules.htmlPatterns?.length) {
     for (const pattern of feedRules.htmlPatterns) {
       try {
         const re = new RegExp(pattern, 'i');
-        $('*').filter((_, el) => {
+        const $matched = $('*').filter((_, el) => {
           return re.test($(el).text()) && $(el).children().length === 0;
-        }).closest('[class],[id]').remove();
+        }).closest('[class],[id]');
+        const parents = $matched.map((_, el) => $(el).parent()[0]).get();
+        $matched.remove();
+        for (const p of parents) pruneNowEmptyAncestors($, p);
       } catch {}
     }
   }
+
   return $.html();
 }
 
@@ -324,6 +366,21 @@ async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
       content = `<figure class="flux-lead-image"><img src="${safeImg}" alt="" loading="lazy" /></figure>` + content;
     }
   }
+
+  // Second block-rules pass, on the fully-assembled final content rather
+  // than the raw pre-Readability page HTML applyBlockRules ran on above.
+  // Necessary because some elements the rules target don't exist yet at
+  // that earlier point — the lead image figure just above is synthesized
+  // by Flux itself *after* Readability runs, so a rule picked against it
+  // (e.g. via the element picker, which shows the rendered reader output)
+  // would have nothing to match against in the earlier pass: it'd get
+  // silently skipped there, then unconditionally re-added by the lead-
+  // image step regardless, making the rule look like it "did nothing" on
+  // every re-fetch. The earlier pass stays as-is — stripping junk from the
+  // raw page before Readability parses it measurably helps Readability's
+  // own content-detection heuristics — this just adds a final safety net
+  // that also covers anything assembled after that point.
+  content = applyBlockRules(content, feedRules);
 
   return {
     title:       readable?.title   || '',
@@ -487,8 +544,8 @@ async function fetchFeed(feedConfig, cookieJars) {
     const hasShortsTag  = /#shorts\b/i.test(`${item.title || ''} ${mediaDescription}`);
     const hasShortsPath = /\/shorts\//i.test(item.link || '');
     const isShort = isYoutube && (hasShortsTag || hasShortsPath);
-    // Stable ID: prioritize guid (Atom's <id> / RSS's <guid>) over link for
-    // identity hashing. This matters more than it looks: <link> is NOT
+    // Stable ID: prioritize guid/id (Atom's <id> / RSS's <guid>) over link
+    // for identity hashing. This matters more than it looks: <link> is NOT
     // guaranteed stable by either spec, and several real feeds exploit
     // that — Daring Fireball's "Linked List" items, for instance, point
     // <link> at whatever external article is being linked to (not at
@@ -499,9 +556,15 @@ async function fetchFeed(feedConfig, cookieJars) {
     // appeared," because that's literally what happens downstream. guid
     // (Atom <id> / RSS <guid>) exists specifically to be a permanent,
     // content-independent identifier per spec, so it should win whenever
-    // present. Only fall back to link, then position, when there's no
-    // guid at all.
-    const rawKey = item.guid || item.link || `${feedConfig.id}-pos-${i}`;
+    // present. Only fall back to link, then position, when there's neither.
+    //
+    // IMPORTANT: rss-parser exposes RSS 2.0's <guid> as item.guid, but
+    // Atom's <id> comes through as item.id instead — a different field
+    // entirely. The check below previously only looked at item.guid, which
+    // is always undefined for Atom feeds (DF included), so it silently
+    // fell through to item.link every single time — exactly the failure
+    // mode this comment describes wanting to prevent. Both are checked now.
+    const rawKey = item.guid || item.id || item.link || `${feedConfig.id}-pos-${i}`;
     let hash = 0;
     for (let c = 0; c < rawKey.length; c++) { hash = ((hash << 5) - hash + rawKey.charCodeAt(c)) | 0; }
     const stableKey = (Math.abs(hash) >>> 0).toString(36) + '_' + rawKey.replace(/[^a-zA-Z0-9._~-]/g,'_').slice(-40);
@@ -510,7 +573,7 @@ async function fetchFeed(feedConfig, cookieJars) {
       id:         `${feedConfig.id}__${stableKey}`,
       feedId:     feedConfig.id,
       title:      decodeHtmlEntities(item.title || 'Untitled'),
-      link:       item.link  || item.guid || '',
+      link:       item.link  || item.guid || item.id || '',
       summary:    decodeHtmlEntities(stripHtml(item.contentSnippet || item.summary || '').slice(0, 300)),
       date:       resolveItemDate(item, feed.title || feedConfig.name),
       isRead:     false,

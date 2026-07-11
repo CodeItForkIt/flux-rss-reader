@@ -745,10 +745,13 @@ function GroupView({ group, feeds, settings, onOpenMember }) {
     </div>
   );
 }
-function InlineBrowser({ url, onClose, onNavigateArticle, isMobile }) {
+function InlineBrowser({ url, onClose, onNavigateArticle, isMobile, trustedDomains, onToggleTrust }) {
   const [loading, setLoading] = useState(true);
   const webviewRef = useRef(null);
   const iframeRef  = useRef(null);
+
+  const hostname = useMemo(() => { try { return new URL(url).hostname; } catch { return null; } }, [url]);
+  const isTrusted = !!(hostname && (trustedDomains || []).includes(hostname));
 
   // Web mode: proxy through the backend so X-Frame-Options/CSP headers that
   // would otherwise block framing are stripped server-side.
@@ -844,6 +847,24 @@ function InlineBrowser({ url, onClose, onNavigateArticle, isMobile }) {
         <IconBtn icon="↺" title="Reload" onClick={reload} size={isMobile?36:28} />
         {loading && <Spinner size={13} />}
         <div style={{ flex:1 }} />
+        {/* Per-domain trust toggle — web mode only. Electron's <webview> is
+            already a fully separate Chromium process, not subject to the
+            iframe-sandbox trade-off this concerns. Trusting a domain lets
+            that specific site's JS use real per-origin storage/cookies
+            (needed for things like theme prefs) — see the sandbox comment
+            below for exactly what that grants and why it's opt-in per site
+            rather than on by default. */}
+        {!api.isElectron && hostname && (
+          <IconBtn
+            icon={isTrusted ? '🔓' : '🔒'}
+            title={isTrusted
+              ? `${hostname} is trusted — its scripts get real storage/cookie access. Click to revoke.`
+              : `Trust ${hostname}? Its scripts will be able to reach this app's window and make requests as your account. Only do this for sites you trust.`}
+            active={isTrusted}
+            onClick={()=>onToggleTrust?.(hostname, !isTrusted)}
+            size={isMobile?36:28}
+          />
+        )}
         <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(url)} size={isMobile?36:28} />
         {!isMobile && <><Divider vertical margin={4} /><Btn small variant="outline" onClick={onClose}>✕ Close</Btn></>}
         {isMobile && <IconBtn icon="✕" title="Close" onClick={onClose} size={36} />}
@@ -863,34 +884,39 @@ function InlineBrowser({ url, onClose, onNavigateArticle, isMobile }) {
         <>
           {url ? (
             <iframe
+              // Remounts (fresh navigation) whenever trust status for this
+              // domain changes — sandbox attribute changes don't apply
+              // retroactively to an already-loaded document.
+              key={`${url}:${isTrusted}`}
               ref={iframeRef}
               src={proxiedSrc}
               onLoad={()=>setLoading(false)}
-              // NOTE: deliberately does NOT include allow-same-origin. This
-              // iframe's document is served from OUR OWN origin (/api/proxy),
-              // just displaying a rewritten copy of someone else's page —
-              // allow-same-origin + allow-scripts together would let that
-              // page's JS treat itself as genuinely same-origin with the
-              // real Flux app: reaching into window.parent's DOM, and
-              // making credentialed fetch()/XHR calls to /api/* that read
-              // real responses (feeds, settings, everything) instead of
-              // being blocked as cross-origin. The opaque sandboxed origin
-              // this omission produces is what actually protects the app;
-              // some sites may behave slightly worse (e.g. code that
-              // assumes persistent per-origin storage, or client-side
-              // theme preferences stored via localStorage/cookies — a
-              // known symptom is a page falling back to its default light
-              // theme regardless of the site's own dark-mode setting)
-              // as a result. That's an acceptable trade for not exposing
-              // the whole account to any page a feed happens to link to;
-              // for JS-heavy sites that lean on that kind of storage, use
-              // "Open in default browser" instead of viewing inline.
+              // Deliberately omits allow-same-origin UNLESS the user has
+              // explicitly trusted this exact hostname via the toggle
+              // above. This iframe's document is served from OUR OWN
+              // origin (/api/proxy), just displaying a rewritten copy of
+              // someone else's page — allow-same-origin + allow-scripts
+              // together let that page's JS treat itself as genuinely
+              // same-origin with the real Flux app: reaching into
+              // window.parent's DOM, and making credentialed fetch()/XHR
+              // calls to /api/* that read real responses (feeds, settings,
+              // everything) instead of being blocked as cross-origin. The
+              // opaque sandboxed origin the omission produces is what
+              // actually protects the app by default; some sites behave
+              // worse without it (e.g. code that assumes persistent
+              // per-origin storage, or client-side theme prefs stored via
+              // localStorage/cookies — a known symptom is a page falling
+              // back to its default light theme regardless of the site's
+              // own dark-mode setting). Trusting a specific, deliberately
+              // chosen domain via the toggle is a reasonable trade for a
+              // site you actually trust; it should never be the default
+              // for arbitrary feed links.
               //
-              // allow-top-navigation-by-user-activation was also removed:
+              // allow-top-navigation-by-user-activation is never included:
               // the shim below intercepts link clicks and hands them to
-              // the system browser instead, so the iframe itself no longer
-              // needs permission to navigate the top-level page at all.
-              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock"
+              // the system browser instead, so the iframe never needs
+              // permission to navigate the top-level page, trusted or not.
+              sandbox={`allow-scripts allow-forms allow-popups allow-pointer-lock${isTrusted ? ' allow-same-origin' : ''}`}
               style={{ flex:1, border:'none', background:'#fff' }}
               title="Inline browser"
             />
@@ -910,7 +936,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, isMobile }) {
 }
 
 // ─── Reader Pane ──────────────────────────────────────────────────────────────
-function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRead, onToggleStar, onOpenRules, onSaveRule, settings, isMobile }) {
+function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRead, onToggleStar, onOpenRules, onSaveRule, onSaveSettings, settings, isMobile }) {
   const [content,    setContent]    = useState(null);
   const [loading,    setLoading]    = useState(false);
   const [error,      setError]      = useState(null);
@@ -1385,11 +1411,10 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
       <div style={{ padding:'10px 20px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, flexShrink:0, background:T.surface }}>
         <IconBtn icon="←" title="Previous (k/←)" onClick={()=>navigate(-1)} size={28} />
         <IconBtn icon="→" title="Next (j/→)"     onClick={()=>navigate(1)}  size={28} />
-        {browStack.length>0&&<><Divider vertical margin={4}/><Btn small variant="outline" icon="↩" onClick={()=>{ const prev=browStack[browStack.length-1]; setBrowStack(s=>s.slice(0,-1)); setBrowUrl(prev||null); if (!prev) setInlineBrow(false); }}>Back</Btn></>}
         <Divider vertical margin={4} />
         <IconBtn icon={article.isStarred?'★':'☆'} title="Star" active={article.isStarred} onClick={()=>onToggleStar(article.id,article.feedId,!article.isStarred)} size={28} />
         <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(article.link)} size={28} />
-        <IconBtn icon="◫" title="Inline browser (remembered per feed)"  active={inlineBrow&&!browStack.length}
+        <IconBtn icon="◫" title="Inline browser (remembered per feed)"  active={inlineBrow}
           onClick={()=>{
             const next = !inlineBrow;
             setInlineBrow(next);
@@ -1448,15 +1473,14 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
             key={article.id}
             url={browUrl}
             isMobile={isMobile}
+            trustedDomains={settings?.trustedInlineDomains || []}
+            onToggleTrust={(hostname, trust) => {
+              const current = settings?.trustedInlineDomains || [];
+              const next = trust ? [...new Set([...current, hostname])] : current.filter(d => d !== hostname);
+              onSaveSettings?.({ ...settings, trustedInlineDomains: next });
+            }}
             onClose={()=>{ setInlineBrow(false); setBrowUrl(null); setBrowStack([]); }}
             onNavigateArticle={navigate}
-            onStepBack={()=>{
-              if (!browStack.length) return;
-              const prev=browStack[browStack.length-1];
-              setBrowStack(s=>s.slice(0,-1));
-              setBrowUrl(prev||null);
-              if (!prev) setInlineBrow(false);
-            }}
           />
         </div>
       )}
@@ -2997,6 +3021,7 @@ function MobileLayout({
         onToggleStar={onToggleStar}
         onOpenRules={setRulesTarget}
         onSaveRule={onSaveRules}
+        onSaveSettings={handleSaveSettings}
         settings={settings}
         isMobile
       />
@@ -3500,10 +3525,17 @@ export default function App() {
     if (!idsToMark.length) return;
     const idSet = new Set(idsToMark.map(x=>x.id));
     setArticles(prev=>prev.map(a=>idSet.has(a.id)?{...a,isRead:true}:a));
-    // Fire all persistence calls in parallel — these are independent
-    // per-article writes, no need to serialize them.
-    await Promise.all(idsToMark.map(({id,feedId})=>api.articles.markRead({articleId:id, feedId}).catch(e=>console.warn('Failed to persist read state for', id, e))));
-  },[visibleArticles]);
+    // Previously this fired one HTTP request + one DB write per article in
+    // parallel (Promise.all over up to hundreds of items), with individual
+    // failures only console.warn'd and never retried. A burst that size
+    // has a real chance of a handful of requests failing under connection-
+    // pool limits or a transient blip, and with no retry those articles
+    // would silently revert to unread on the next reload — exactly the
+    // reported symptom. Now a single batched request with one retry,
+    // matching handleMarkRead's persistWithRetry above.
+    const items = idsToMark.map(({id,feedId})=>({articleId:id, feedId}));
+    await persistWithRetry(() => api.articles.markReadBulk(items), 'read state for all articles');
+  },[visibleArticles, persistWithRetry]);
 
   if (authState === 'checking') {
     return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh', background:T.bg, color:T.textSubtle, fontSize:13 }}>
@@ -3554,7 +3586,7 @@ export default function App() {
     <div style={{ display:'flex', height:'100vh', overflow:'hidden' }}>
       <Sidebar folders={folders_} feeds={feeds_} articles={articles} activeView={activeView} onSelectView={(v)=>{ setActiveView(v); setArticleListCollapsed(false); }} onOpenAddFeed={(folder)=>setShowAddFeed(folder&&folder.id?folder:true)} onAddToFolder={(folder)=>setAddToFolderTarget(folder)} onRefreshAll={handleRefreshAll} refreshing={refreshing} onExportOPML={handleExportOPML} onImportOPML={handleImportOPML} onNewFolder={()=>setShowNewFolder(true)} onOpenSettings={()=>setShowSettings(true)} onFeedSettings={setRulesTarget} onRemoveFeed={handleRemoveFeed} onRemoveFolder={handleRemoveFolder} onManageFolderFeeds={setManageFolderTarget} newArticleCount={newArticleCount} settings={settings} onReorderFolders={handleReorderFolders} onEditFolder={setEditFolderTarget} />
       <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} />
-      <ReaderPane article={selectedArticle} feed={feeds_.find(f=>f.id===selectedArticle?.feedId)} allArticles={visibleArticles} allFeeds={feeds_} onNavigate={setSelectedArticle} onMarkRead={handleMarkRead} onToggleStar={handleToggleStar} onOpenRules={setRulesTarget} onSaveRule={handleSaveRules} settings={settings} />
+      <ReaderPane article={selectedArticle} feed={feeds_.find(f=>f.id===selectedArticle?.feedId)} allArticles={visibleArticles} allFeeds={feeds_} onNavigate={setSelectedArticle} onMarkRead={handleMarkRead} onToggleStar={handleToggleStar} onOpenRules={setRulesTarget} onSaveRule={handleSaveRules} onSaveSettings={handleSaveSettings} settings={settings} />
     </div>
 
     {refreshing&&<div style={{ position:'fixed', bottom:16, right:16, background:T.surface, border:`1px solid ${T.border}`, borderRadius:8, padding:'8px 12px', display:'flex', alignItems:'center', gap:8, fontSize:12, color:T.textMuted, boxShadow:'0 4px 16px rgba(0,0,0,.3)', zIndex:50 }}><Spinner size={12}/>Fetching feeds…</div>}

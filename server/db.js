@@ -263,6 +263,18 @@ class JSONStore {
     row.isRead = true;
     this._save();
   }
+  // Bulk variant for "mark all read" — see the matching comment in
+  // db-supabase.js. Here the main win is calling _save() once instead of
+  // once per article (that's a full JSON.stringify + file write each
+  // time), rather than a network-round-trip concern.
+  markReadBulk(userId, keys) {
+    for (const key of keys) {
+      let row = this.data.articleState.find(r => r.userId === userId && r.key === key);
+      if (!row) { row = { key, userId, isRead: false, isStarred: false }; this.data.articleState.push(row); }
+      row.isRead = true;
+    }
+    if (keys.length) this._save();
+  }
   toggleStar(userId, key, starred) {
     let row = this.data.articleState.find(r => r.userId === userId && r.key === key);
     if (!row) { row = { key, userId, isRead: false, isStarred: false }; this.data.articleState.push(row); }

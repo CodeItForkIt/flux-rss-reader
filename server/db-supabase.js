@@ -255,6 +255,22 @@ class SupabaseStore {
     const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: true }, { onConflict: 'key,user_id' });
     this._throw(error, 'markRead');
   }
+  // Bulk variant for "mark all read" — previously the client fired one
+  // HTTP request + one upsert per article (potentially hundreds at once
+  // for a big unread pile). Besides being slow, a burst that size has a
+  // real chance of a handful of requests failing under Supabase's
+  // connection-pool limits or transient network blips — and with nothing
+  // retrying those individually-failed writes, the articles they belonged
+  // to would quietly revert to unread on the next reload. A single upsert
+  // with all rows is one round-trip and one statement: either all of it
+  // lands or the caller gets one clear error to retry, not a partial,
+  // silent failure spread across N independent requests.
+  async markReadBulk(userId, keys) {
+    if (!keys.length) return;
+    const rows = keys.map(key => ({ key, user_id: userId, is_read: true }));
+    const { error } = await this.sb.from('article_state').upsert(rows, { onConflict: 'key,user_id' });
+    this._throw(error, 'markReadBulk');
+  }
   async toggleStar(userId, key, starred) {
     const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_starred: !!starred }, { onConflict: 'key,user_id' });
     this._throw(error, 'toggleStar');

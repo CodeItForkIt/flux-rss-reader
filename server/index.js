@@ -643,14 +643,17 @@ app.post('/api/article/fetch', async (req, res) => {
   const { url, feedId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  const ttl = await articleTtlMs(req.userId);
-  const cached = await articleCache.get(url);
+  // These two are independent reads — previously sequential (ttl, then
+  // cache), meaning every single article open paid for two round-trips
+  // back-to-back before any actual work started. articleTtlMs also now
+  // goes through getSettingsCached rather than hitting Supabase directly.
+  const [ttl, cached] = await Promise.all([articleTtlMs(req.userId), articleCache.get(url)]);
   if (cached && Date.now() - cached.ts < ttl) return res.json(cached.result);
 
   const feed = feedId ? await db.findFeed(req.userId, feedId) : null;
   const feedRowData = feed ? feedRow(feed) : null;
   if (feedRowData && !feedRowData.fetchStrategyOrder?.length) {
-    const globalOrder = (await db.getSettings(req.userId)).fetchStrategyOrder;
+    const globalOrder = (await getSettingsCached(req.userId)).fetchStrategyOrder;
     if (globalOrder?.length) feedRowData.fetchStrategyOrder = globalOrder;
   }
   try {
@@ -676,6 +679,12 @@ app.post('/api/articles/mark-read', async (req, res) => {
   const { articleId, feedId } = req.body;
   await db.markRead(req.userId, `${feedId}:${articleId}`);
   res.json({ ok: true });
+});
+app.post('/api/articles/mark-read-bulk', async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const keys = items.filter(x => x?.articleId && x?.feedId).map(x => `${x.feedId}:${x.articleId}`);
+  await db.markReadBulk(req.userId, keys);
+  res.json({ ok: true, count: keys.length });
 });
 app.post('/api/articles/toggle-star', async (req, res) => {
   const { articleId, feedId, starred } = req.body;
@@ -777,6 +786,19 @@ function buildProxyShim(base, token) {
       try{ arguments[1]=toProxied(url); }catch(e){}
       return oo.apply(this, arguments);
     };
+    // Every link on the framed page should exit to the user's real browser
+    // instead of navigating around inside this iframe — capture-phase so
+    // this runs before the page's own click handlers, and stopPropagation
+    // so the page never sees the click and can't act on it itself.
+    document.addEventListener('click', function(e){
+      var a = e.target && e.target.closest && e.target.closest('a[href]');
+      if (!a) return;
+      var href = a.getAttribute('href') || '';
+      if (!href || href.charAt(0)==='#' || href.indexOf('javascript:')===0) return;
+      var abs; try { abs = new URL(href, document.baseURI).href; } catch(e){ return; }
+      e.preventDefault(); e.stopPropagation();
+      try { window.parent.postMessage({ type:'flux-proxy-link-click', url: abs }, '*'); } catch(e){}
+    }, true);
   })();</script>`;
 }
 
@@ -812,7 +834,7 @@ app.post('/api/opml/import', upload.single('file'), async (req, res) => {
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 app.get('/api/settings', async (req, res) => res.json(await db.getSettings(req.userId)));
-app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); res.json({ ok: true }); });
+app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); invalidateSettingsCache(req.userId); res.json({ ok: true }); });
 
 // ─── Ollama ───────────────────────────────────────────────────────────────────
 // The Electron app starts/stops Ollama from its main process via child_process.
