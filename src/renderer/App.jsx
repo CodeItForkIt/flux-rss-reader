@@ -3221,6 +3221,13 @@ export default function App() {
     setRefreshing(true);
     const readSet  = new Set(state?.read    || []);
     const starSet  = new Set(state?.starred || []);
+    // Captured explicitly rather than read back from articlesRef.current
+    // afterward — that ref only updates via a useEffect that fires on the
+    // *next* render commit, so immediately after the setArticles() calls
+    // below (still within this same synchronous function run) it would
+    // still reflect whatever articles were current before this refresh
+    // started, not what was just fetched.
+    let finalArticlesForCache = null;
 
     try {
       if (api.isElectron) {
@@ -3270,7 +3277,9 @@ export default function App() {
         unsub(); // clean up listener
 
         // Final dedup pass in case of any last stragglers
-        setArticles(prev => articleState.mergeArticlesWithState(prev, [], readSet, starSet));
+        const deduped = articleState.mergeArticlesWithState(accumulated, [], readSet, starSet);
+        setArticles(deduped);
+        finalArticlesForCache = deduped;
 
       } else {
         // ── Batch path (web server) ───────────────────────────────────────
@@ -3292,7 +3301,9 @@ export default function App() {
           isRead:    readSet.has(`${item.feedId}:${item.id}`),
           isStarred: starSet.has(`${item.feedId}:${item.id}`),
         })));
-        setArticles(articleState.mergeArticlesWithState(articlesRef.current, allItems, readSet, starSet));
+        const merged = articleState.mergeArticlesWithState(articlesRef.current, allItems, readSet, starSet);
+        setArticles(merged);
+        finalArticlesForCache = merged;
       }
 
       // AI clustering — opt-in only, runs after articles are visible
@@ -3308,8 +3319,22 @@ export default function App() {
         } catch { setClusterState(null); }
       }
 
-    } finally { setRefreshing(false); }
-  },[settings]);
+    } finally {
+      setRefreshing(false);
+      // This is the fix for "cached articles should show while fetching new
+      // ones": that mechanism (seeding articles/feeds state from
+      // localStorage on mount, see _cached above) was already fully wired
+      // up on the *reading* side, but saveCache — the function that
+      // actually writes to that localStorage key — was never called
+      // anywhere in the app. The cache was permanently empty, so every
+      // single load started from a blank article list regardless of how
+      // recently you'd last used the app, no matter how well the seeding
+      // logic itself worked. feeds_ is read fresh here rather than
+      // threading feedList through, since feedList is this call's
+      // snapshot from before any favicon updates just landed.
+      if (finalArticlesForCache) saveCache({ articles: finalArticlesForCache, feeds: feeds_ });
+    }
+  },[settings, feeds_]);
 
   useEffect(()=>{
     if (authState !== 'ok') return;
@@ -3318,6 +3343,7 @@ export default function App() {
         setFeeds(f); setFolders(fo);
         const merged = { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaAutoStart:false, ollamaUrl:'', ollamaModel:'', ...(s||{}) };
         setSettings(merged);
+        saveCache({ feeds: f, folders: fo, settings: merged });
         if(f.length>0) refreshFeeds(f,state,merged);
       });
   },[authState]);

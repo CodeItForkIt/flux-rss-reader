@@ -36,7 +36,7 @@ const { createStore } = require('./store-factory');
 const { getSessionToken, setSessionCookie, clearSessionCookie } = require('./auth-utils');
 
 const {
-  loadDeps, fetchArticle, fetchFeed, fetchWithCookies,
+  loadDeps, fetchArticle, fetchFeed, fetchFeedAvatar, fetchWithCookies,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest, resolveFeedUrl,
 } = require('../src/core/fetcher');
 
@@ -198,6 +198,27 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
     } catch (e) { console.warn('[feed-cache] read failed, falling back to live fetch:', e.message); }
   }
   const result = await fetchFeed(feed, cookieJars);
+
+  // Upgrade YouTube feeds from the generic fallback favicon to the real
+  // channel avatar, exactly once per feed. fetchFeedAvatar does a genuine
+  // extra HTTP fetch (scraping the channel page for its og:image, since
+  // YouTube's own feed XML doesn't expose an avatar at all) — deliberately
+  // NOT awaited here, so it can't add its ~300-800ms to this request. It
+  // runs in the background and persists straight to the feed row; the
+  // `!feed.favicon` guard is what makes this "exactly once" rather than
+  // "every single refresh" — once persisted, fetchFeed above will see
+  // feedConfig.favicon already set and skip recomputing anything, and this
+  // block won't fire again for that feed. This was previously dead code:
+  // fetchFeedAvatar existed but nothing anywhere ever called it, so every
+  // YouTube feed was permanently stuck on the generic fallback icon.
+  if (!feed.favicon && (feed.isYoutube || feed.url.includes('youtube.com'))) {
+    fetchFeedAvatar(feed, cookieJars).then(async (avatarUrl) => {
+      if (!avatarUrl) return;
+      try { await db.updateFeed(userId, feed.id, { favicon: avatarUrl }); }
+      catch (e) { console.warn('[feed-avatar] failed to persist for', feed.id, e.message); }
+    }).catch(e => console.warn('[feed-avatar] fetch failed for', feed.id, e.message));
+  }
+
   articleCache.set(key, { ts: Date.now(), feedId: null, result }).catch(e =>
     console.warn('[feed-cache] write failed (non-fatal — this feed just won\'t be cached this round):', e.message));
   return result;

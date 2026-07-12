@@ -556,7 +556,7 @@ async function fetchFeed(feedConfig, cookieJars) {
     // appeared," because that's literally what happens downstream. guid
     // (Atom <id> / RSS <guid>) exists specifically to be a permanent,
     // content-independent identifier per spec, so it should win whenever
-    // present. Only fall back to link, then position, when there's neither.
+    // present.
     //
     // IMPORTANT: rss-parser exposes RSS 2.0's <guid> as item.guid, but
     // Atom's <id> comes through as item.id instead — a different field
@@ -564,7 +564,26 @@ async function fetchFeed(feedConfig, cookieJars) {
     // is always undefined for Atom feeds (DF included), so it silently
     // fell through to item.link every single time — exactly the failure
     // mode this comment describes wanting to prevent. Both are checked now.
-    const rawKey = item.guid || item.id || item.link || `${feedConfig.id}-pos-${i}`;
+    //
+    // Below THAT, before finally falling back to raw array position: a
+    // feed with no guid/id/link at all (rare, but real — some minimal or
+    // broken feeds genuinely omit all three) previously fell straight to
+    // `${feedId}-pos-${i}`, keyed purely on the item's index in this
+    // fetch's array. That's fragile in a specific, easy-to-hit way: if the
+    // feed's item order shifts at all between fetches — a new item gets
+    // inserted at the top, one gets removed, the publisher re-sorts —
+    // every subsequent item's index shifts too, so position i now refers
+    // to a genuinely different article than it did last time. The article
+    // that used to own that ID keeps it, misattributing its read/starred
+    // state to whatever article now happens to sit in that slot, while the
+    // real previously-read article looks unread again under a new one.
+    // Title+pubDate is a much better last resort: both fields belong to
+    // the article itself, not its position, so they stay attached to the
+    // right item regardless of how the feed reorders things around it —
+    // this only degrades to pure position when a feed is missing all four
+    // of guid, id, link, AND title+pubDate, which is vanishingly rare.
+    const contentKey = (item.title && (item.pubDate || item.isoDate)) ? `content:${item.title}|${item.pubDate || item.isoDate}` : null;
+    const rawKey = item.guid || item.id || item.link || contentKey || `${feedConfig.id}-pos-${i}`;
     let hash = 0;
     for (let c = 0; c < rawKey.length; c++) { hash = ((hash << 5) - hash + rawKey.charCodeAt(c)) | 0; }
     const stableKey = (Math.abs(hash) >>> 0).toString(36) + '_' + rawKey.replace(/[^a-zA-Z0-9._~-]/g,'_').slice(-40);
@@ -594,12 +613,21 @@ async function fetchFeed(feedConfig, cookieJars) {
   // optionally do the avatar upgrade in the background. The 300-800ms
   // channel-page fetch per YouTube feed was a major contributor to slow
   // refresh times when a user has multiple YouTube channels subscribed.
-  let favicon = null;
-  try {
-    const homeUrl = feed.link || feedConfig.url;
-    const origin  = new URL(homeUrl).origin;
-    favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(origin)}&sz=32`;
-  } catch {}
+  //
+  // Only computed when feedConfig doesn't already have a favicon — this
+  // previously ran unconditionally on every single fetch, which meant a
+  // real, already-fetched-and-persisted YouTube channel avatar (see
+  // fetchFeedAvatar below) got silently clobbered back to the generic
+  // fallback on the very next refresh, every time — the avatar upgrade
+  // could never actually stick.
+  let favicon = feedConfig.favicon || null;
+  if (!favicon) {
+    try {
+      const homeUrl = feed.link || feedConfig.url;
+      const origin  = new URL(homeUrl).origin;
+      favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(origin)}&sz=32`;
+    } catch {}
+  }
 
   return { feedId: feedConfig.id, title: feed.title || feedConfig.name, items, favicon };
 }
