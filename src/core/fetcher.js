@@ -54,6 +54,12 @@ function getCookieJar(domain, jars) {
 
 // ─── HTTP fetch with cookie jar ───────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// Used by the inline-browser proxy when the requesting Flux client is
+// itself on a mobile viewport (see the `mobile=1` query param on
+// /api/proxy in server/index.js) — a page rendered in its desktop layout
+// inside a phone-width iframe is often unreadable, whereas most sites that
+// do UA-sniffing serve a purpose-built, narrower mobile layout instead.
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
 async function fetchWithCookies(url, opts = {}, cookieJars) {
   await loadDeps();
@@ -108,6 +114,19 @@ async function fetchWithCookies(url, opts = {}, cookieJars) {
 // timeout at all — unlike fetchWithCookies, which has always aborted at
 // 15s. A hung connection to either host could stall an article-open
 // indefinitely. This gives any fetch the same abort-based timeout.
+// Thrown by a fetch strategy when the response's actual Content-Type header
+// says this isn't HTML at all — checked before decoding as text, which
+// matters: unlike PDF's %PDF- signature (plain ASCII, survives UTF-8
+// decoding, so the existing magic-byte check on the decoded string further
+// down still works for that case), image formats' magic bytes are
+// non-ASCII and get mangled into replacement characters by the time
+// resp.text() has decoded them — a string-based check after the fact
+// can't reliably detect an image, so this has to happen at the header
+// level, before decoding.
+class NonHtmlContentError extends Error {
+  constructor(contentType, url) { super(`Non-HTML content-type: ${contentType}`); this.contentType = contentType; this.sourceUrl = url; }
+}
+
 async function withTimeout(url, opts, ms) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -132,21 +151,47 @@ const FETCH_STRATEGIES = {
   direct: {
     minLength: 5000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(url, { timeoutMs: 9000 }, cookieJars);
+      const resp = await fetchWithCookies(url, { timeoutMs: 8000 }, cookieJars);
+      if (!resp.ok) return null;
+      const ct = resp.headers.get('content-type') || '';
+      // A feed's <link> can point straight at a non-HTML file — most
+      // commonly an image (photo-blog/Tumblr-style feeds, direct
+      // image-host links) or a PDF (the PDF case is caught further down
+      // in fetchArticle via its magic-byte signature, since %PDF- is
+      // plain ASCII and survives being decoded as text; images aren't so
+      // this has to be caught here instead, before decoding).
+      if (ct.startsWith('image/')) throw new NonHtmlContentError(ct, url);
+      return await resp.text();
+    },
+  },
+  // Distinct from 'direct' only in sending a Google-search Referer header.
+  // Several paywalled/gift-link publications (WSJ, and others historically)
+  // intentionally grant full access to traffic that appears to arrive from
+  // a Google search result — well-documented SEO practice, since blocking
+  // Google's own crawler or search-referred readers hurts a site's search
+  // ranking and click-through. A referral link shared via a blog or feed
+  // (a Daring Fireball Linked List item, for instance) doesn't carry that
+  // referer on a direct server-side fetch the way a browser navigation
+  // would, so gift-link articles could hit the real paywall despite being
+  // freely readable when actually clicked through from the source page.
+  'google-referer': {
+    minLength: 5000,
+    run: async (url, cookieJars) => {
+      const resp = await fetchWithCookies(url, { timeoutMs: 5000, headers: { Referer: 'https://www.google.com/' } }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   '12ft.io': {
     minLength: 3000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, { timeoutMs: 6000 }, cookieJars);
+      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, { timeoutMs: 5000 }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   'archive.ph': {
     minLength: 3000,
     run: async (url) => {
-      const resp = await withTimeout(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' }, 6000);
+      const resp = await withTimeout(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' }, 5000);
       return resp.ok ? await resp.text() : null;
     },
   },
@@ -157,14 +202,15 @@ const FETCH_STRATEGIES = {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Referer': 'https://www.google.com/',
         },
         redirect: 'follow',
-      }, 5000);
+      }, 4000);
       return resp.ok ? await resp.text() : null;
     },
   },
 };
-const DEFAULT_STRATEGY_ORDER = ['direct', '12ft.io', 'archive.ph', 'googlebot-ua'];
+const DEFAULT_STRATEGY_ORDER = ['direct', 'google-referer', '12ft.io', 'archive.ph', 'googlebot-ua'];
 
 // order: optional array of strategy names controlling priority — lets the
 // user customize fetch order globally (Settings) or per-feed (feed rules),
@@ -178,7 +224,10 @@ async function fetchArticleHtml(url, cookieJars, order) {
     try {
       const html = await strategy.run(url, cookieJars);
       if (html && html.length > strategy.minLength) return { html, source: name };
-    } catch (e) { console.warn(`[fetch/${name}]`, e.name === 'AbortError' ? 'timed out' : e.message); }
+    } catch (e) {
+      if (e instanceof NonHtmlContentError) throw e; // no fetch strategy will turn an image into HTML — stop immediately
+      console.warn(`[fetch/${name}]`, e.name === 'AbortError' ? 'timed out' : e.message);
+    }
   }
 
   throw new Error('All fetch strategies exhausted for: ' + url);
@@ -308,10 +357,52 @@ function extractReadable(html, url) {
 async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
   await loadDeps();
 
+  // Some feeds' <link> doesn't point at "the article" at all — see the
+  // matching comment on rssContent in fetchFeed above for the Daring
+  // Fireball Linked List example (link points at whatever external page is
+  // being linked to; the feed's own content holds the actual commentary).
+  // When the feed itself already supplies substantial content, use it
+  // directly rather than live-fetching and Readability-extracting whatever
+  // <link> happens to point at — for feeds like this, that's both more
+  // correct (shows the feed owner's own writing, not an unrelated external
+  // page) and faster (skips the fetch+extraction pipeline entirely).
+  // "Substantial" uses the same >400-stripped-character threshold applied
+  // when this was captured at feed-fetch time, so a feed that only ever
+  // supplies a short teaser in its RSS still falls through to the normal
+  // live-fetch behavior below, unchanged.
+  if (rssFallback?.content && stripHtml(rssFallback.content).trim().length > 400) {
+    const text = rssFallback.content;
+    return {
+      title:       rssFallback.title  || '',
+      byline:      rssFallback.byline || '',
+      content:     sanitizeArticleHtml(text),
+      excerpt:     stripHtml(text).trim().slice(0, 300),
+      siteName:    '',
+      bypassSource:'rss-content',
+      length:      stripHtml(text).trim().length,
+    };
+  }
+
   let html, source;
   try {
     ({ html, source } = await fetchArticleHtml(url, cookieJars, feedRules?.fetchStrategyOrder));
   } catch (fetchErr) {
+    // A bare image link (see NonHtmlContentError above) — unlike a genuine
+    // fetch failure or a PDF, this is trivial to actually render well:
+    // just show the image directly instead of attempting text extraction
+    // on it, which previously either errored out or produced blank/garbled
+    // output since Readability has no real HTML structure to work with.
+    if (fetchErr instanceof NonHtmlContentError) {
+      return {
+        title:       rssFallback?.title || '',
+        byline:      '',
+        content:     sanitizeArticleHtml(`<img src="${url}" alt="" style="max-width:100%;height:auto;display:block;margin:0 auto;" />`),
+        excerpt:     '',
+        siteName:    '',
+        bypassSource:'direct-image',
+        length:      0,
+      };
+    }
     // All fetch strategies failed — fall back to the RSS summary/description
     // if the caller supplied one (common for paywalled sites like Bloomberg
     // that include their article text in the RSS item itself). Show a notice
@@ -464,6 +555,35 @@ async function fetchYoutubeChannelAvatar(feedUrl, cookieJars) {
   } catch { return null; }
 }
 
+// ISO 8601 duration (e.g. "PT4M13S", "PT1H2M3S", "PT45S") → "4:13" /
+// "1:02:03" / "0:45" display format.
+function formatIso8601Duration(iso) {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
+  if (!m) return null;
+  const h = parseInt(m[1] || '0', 10), min = parseInt(m[2] || '0', 10), s = parseInt(m[3] || '0', 10);
+  if (!h && !min && !s) return null;
+  return h > 0 ? `${h}:${String(min).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${min}:${String(s).padStart(2,'0')}`;
+}
+
+// YouTube's RSS feed items don't expose video duration in any form (see
+// toShortsFreeYoutubeUrl's comment above) — the only way to get it is a
+// secondary fetch of the video's own watch page, which exposes it via the
+// standard schema.org VideoObject microdata (`<meta itemprop="duration"
+// content="PT4M13S">`). Unlike the channel avatar (one extra request per
+// *feed*), this is one extra request per *video* — a channel with 30
+// videos in its feed would mean 30 extra fetches, which is both slow and
+// a good way to get rate-limited. Callers are expected to bound how many
+// of these run per refresh (see fetchFeedCached in server/index.js) rather
+// than fetching duration for every video in a feed unconditionally.
+async function fetchYoutubeVideoDuration(videoUrl, cookieJars) {
+  try {
+    const resp = await fetchWithCookies(videoUrl, { timeoutMs: 5000 }, cookieJars);
+    const html = await resp.text();
+    const match = html.match(/<meta\s+itemprop=["']duration["']\s+content=["']([^"']+)["']/i);
+    return match ? formatIso8601Duration(match[1]) : null;
+  } catch { return null; }
+}
+
 // ─── RSS feed fetch ───────────────────────────────────────────────────────────
 async function fetchFeed(feedConfig, cookieJars) {
   await loadDeps();
@@ -530,6 +650,7 @@ async function fetchFeed(feedConfig, cookieJars) {
     const thumbnail =
       item.mediaThumbnail?.['$']?.url ||
       item.mediaGroup?.['media:thumbnail']?.[0]?.['$']?.url ||
+      (item.enclosure?.type?.startsWith('image/') ? item.enclosure.url : null) ||
       (videoId ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg` : null);
 
     // Heuristic Shorts detection (fallback for feeds where the playlist_id
@@ -588,12 +709,29 @@ async function fetchFeed(feedConfig, cookieJars) {
     for (let c = 0; c < rawKey.length; c++) { hash = ((hash << 5) - hash + rawKey.charCodeAt(c)) | 0; }
     const stableKey = (Math.abs(hash) >>> 0).toString(36) + '_' + rawKey.replace(/[^a-zA-Z0-9._~-]/g,'_').slice(-40);
 
+    // Some feeds' <link> doesn't point at "the article" at all — Daring
+    // Fireball's Linked List format is the clearest example: <link> points
+    // at whatever external page is being linked to, while the feed's own
+    // <content> holds Gruber's actual commentary about it. Previously only
+    // a 300-char plain-text `summary` was kept from RSS content (sized for
+    // the article-list preview), and opening an article always live-fetched
+    // and Readability-extracted whatever <link> pointed at — for a Linked
+    // List item, that's the external site, not the feed owner's own
+    // commentary, so the commentary (the actual "text around the link")
+    // never appeared anywhere. rssContent preserves the full thing when
+    // it's substantial, so fetchArticle can prefer it — see the matching
+    // comment there for the size heuristic.
+    const rawContent = item['content:encoded'] || item.content || '';
+    const strippedLen = stripHtml(rawContent).trim().length;
+    const rssContent = strippedLen > 400 ? rawContent : null;
+
     return {
       id:         `${feedConfig.id}__${stableKey}`,
       feedId:     feedConfig.id,
       title:      decodeHtmlEntities(item.title || 'Untitled'),
       link:       item.link  || item.guid || item.id || '',
       summary:    decodeHtmlEntities(stripHtml(item.contentSnippet || item.summary || '').slice(0, 300)),
+      rssContent,
       date:       resolveItemDate(item, feed.title || feedConfig.name),
       isRead:     false,
       isStarred:  false,
@@ -1031,8 +1169,8 @@ async function resolveYoutubeFeedUrl(parsedUrl, cookieJars) {
 
 module.exports = {
   loadDeps, fetchWithCookies, fetchArticleHtml, fetchArticle,
-  applyBlockRules, extractReadable, fetchFeed, fetchFeedAvatar,
+  applyBlockRules, extractReadable, fetchFeed, fetchFeedAvatar, fetchYoutubeVideoDuration,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest,
-  getCookieJar, resolveFeedUrl, sanitizeArticleHtml,
+  getCookieJar, resolveFeedUrl, sanitizeArticleHtml, MOBILE_UA,
   FETCH_STRATEGY_NAMES: DEFAULT_STRATEGY_ORDER,
 };

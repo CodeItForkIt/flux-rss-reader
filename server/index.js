@@ -36,7 +36,7 @@ const { createStore } = require('./store-factory');
 const { getSessionToken, setSessionCookie, clearSessionCookie } = require('./auth-utils');
 
 const {
-  loadDeps, fetchArticle, fetchFeed, fetchFeedAvatar, fetchWithCookies,
+  loadDeps, fetchArticle, fetchFeed, fetchFeedAvatar, fetchYoutubeVideoDuration, fetchWithCookies, MOBILE_UA,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest, resolveFeedUrl,
 } = require('../src/core/fetcher');
 
@@ -198,6 +198,39 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
     } catch (e) { console.warn('[feed-cache] read failed, falling back to live fetch:', e.message); }
   }
   const result = await fetchFeed(feed, cookieJars);
+
+  // YouTube video duration: RSS doesn't expose it at all (see
+  // fetchYoutubeVideoDuration's comment in core/fetcher.js), so this
+  // maintains its own small cache, keyed globally by video ID rather than
+  // per-user/per-feed like the feed-cache above — a video's duration is
+  // public, unchanging data, identical for every user who happens to
+  // subscribe to the same channel, so there's no reason to fetch or store
+  // it more than once ever, system-wide.
+  //
+  // Bounded on both axes: only the first 10 videos in this response that
+  // are missing a duration get *looked up* in the cache at all (avoids N
+  // parallel Supabase reads for a feed with dozens of items), and of
+  // those, only the first 4 that come back as genuinely uncached trigger
+  // an actual new background fetch (each one is a real HTTP request to a
+  // video's watch page — unbounded, that's a lot of outbound requests
+  // and a good way to get rate-limited on a channel with many videos).
+  // Durations found in cache are attached synchronously so they appear on
+  // this very response; newly-fetched ones are cached in the background
+  // and will appear starting next refresh.
+  if (feed.isYoutube || feed.url.includes('youtube.com')) {
+    const candidates = (result.items || []).filter(item => item.videoId && !item.duration).slice(0, 10);
+    const durKeys = candidates.map(item => `flux-video-duration::${item.videoId}`);
+    const cachedDurations = await Promise.all(durKeys.map(k => articleCache.get(k).catch(() => null)));
+    let fetchBudget = 4;
+    candidates.forEach((item, i) => {
+      if (cachedDurations[i]?.result) { item.duration = cachedDurations[i].result; return; }
+      if (fetchBudget-- <= 0) return;
+      fetchYoutubeVideoDuration(item.link, cookieJars).then(duration => {
+        if (!duration) return;
+        articleCache.set(durKeys[i], { ts: Date.now(), feedId: null, result: duration }).catch(() => {});
+      }).catch(() => {});
+    });
+  }
 
   // Upgrade YouTube feeds from the generic fallback favicon to the real
   // channel avatar, exactly once per feed. fetchFeedAvatar does a genuine
@@ -524,6 +557,8 @@ const feedRow = (f) => ({
   favicon:       f.favicon || null,
   titleBlocklist: f.titleBlocklist || [],
   fetchStrategyOrder: f.fetchStrategyOrder || [],
+  showThumbnail: f.showThumbnail === true ? true : f.showThumbnail === false ? false : null,
+  autoRefreshEnabled: f.autoRefreshEnabled !== false,
 });
 
 app.get('/api/feeds', async (req, res) => {
@@ -582,7 +617,7 @@ app.post('/api/feeds', async (req, res) => {
   res.json(feedRow(feed));
 });
 app.patch('/api/feeds/:id', async (req, res) => {
-  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url } = req.body;
+  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail } = req.body;
   const patch = {};
   if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
   if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -593,6 +628,10 @@ app.patch('/api/feeds/:id', async (req, res) => {
   if (favicon       !== undefined) patch.favicon       = favicon;
   if (titleBlocklist!== undefined) patch.titleBlocklist= titleBlocklist;
   if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
+  // Tri-state: true/false is an explicit override, null means "inherit the
+  // global setting" — all three are meaningful, so this checks `!==
+  // undefined` (missing from the request at all) rather than truthiness.
+  if (showThumbnail !== undefined) patch.showThumbnail = showThumbnail;
   if (url !== undefined) {
     let newUrl = url.trim();
     if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
@@ -697,8 +736,8 @@ app.post('/api/article/clear-cache', async (req, res) => {
 // ─── Article state ────────────────────────────────────────────────────────────
 app.get('/api/articles/state', async (req, res) => res.json(await db.getArticleState(req.userId)));
 app.post('/api/articles/mark-read', async (req, res) => {
-  const { articleId, feedId } = req.body;
-  await db.markRead(req.userId, `${feedId}:${articleId}`);
+  const { articleId, feedId, read } = req.body;
+  await db.markRead(req.userId, `${feedId}:${articleId}`, read !== false);
   res.json({ ok: true });
 });
 app.post('/api/articles/mark-read-bulk', async (req, res) => {
@@ -738,7 +777,14 @@ app.get('/api/proxy', async (req, res) => {
   const ssrfError = await checkSsrfSafe(parsed.hostname);
   if (ssrfError) return res.status(400).send(ssrfError);
   try {
-    const upstream = await fetchWithCookies(target, {}, cookieJars);
+    // Sites that do UA-sniffing serve their (often much more legible in a
+    // narrow iframe) mobile layout when asked for it — the client sets
+    // mobile=1 based on its own responsive layout state (see InlineBrowser
+    // in App.jsx), so the linked page's layout matches whatever Flux
+    // itself is currently using rather than always forcing a desktop
+    // layout into a phone-width frame.
+    const useMobileUA = req.query.mobile === '1';
+    const upstream = await fetchWithCookies(target, useMobileUA ? { headers: { 'User-Agent': MOBILE_UA } } : {}, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
     if (ct.includes('text/html')) {
       let html = await upstream.text();
@@ -761,7 +807,7 @@ app.get('/api/proxy', async (req, res) => {
         // CSS url(...) in <style> blocks and inline style attributes
         .replace(/url\((["']?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
         .replace(/url\((["']?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
-        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || '')));
+        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || ''), req.query.mobile === '1'));
       // Strip ALL frame-blocking mechanisms — X-Frame-Options and CSP
       // frame-ancestors both prevent the proxy iframe from rendering.
       res.removeHeader('X-Frame-Options');
@@ -778,19 +824,21 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) { res.status(502).send(`Proxy fetch failed: ${e.message}`); }
 });
 
-function buildProxyShim(base, token) {
+function buildProxyShim(base, token, mobile) {
   // Runs before any of the page's own <script> tags. Rewrites same-page
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
     var BASE=${JSON.stringify(base)};
     var TOKEN=${JSON.stringify(token || '')};
+    var MOBILE=${mobile ? 'true' : 'false'};
     function toProxied(u){
       try{
         var abs=new URL(u, document.baseURI).href;
         if (abs.indexOf(location.origin+'/api/proxy')===0) return u; // already proxied
         var proxied='/api/proxy?url='+encodeURIComponent(abs);
         if (TOKEN) proxied += '&token='+encodeURIComponent(TOKEN);
+        if (MOBILE) proxied += '&mobile=1';
         return proxied;
       }catch(e){ return u; }
     }

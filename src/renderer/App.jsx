@@ -318,14 +318,10 @@ function Sidebar({ folders, feeds, articles, activeView, onSelectView, onOpenAdd
     return articles.filter(a => {
       const feed = feeds.find(f => f.id === a.feedId);
       if (feed?.hideShorts && a.isShort) return false;
-      if (feed?.titleBlocklist?.length) {
-        for (const pattern of feed.titleBlocklist) {
-          try { if (new RegExp(pattern,'i').test(a.title)) return false; } catch {}
-        }
-      }
+      if (titleIsBlocked(a.title, feed, settings)) return false;
       return true;
     });
-  }, [articles, feeds]);
+  }, [articles, feeds, settings]);
   const unreadInFolder = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&(fid==='__all'||feeds.find(f=>f.id===a.feedId)?.folder===fid)).length;
   const unreadInFeed   = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&a.feedId===fid).length;
 
@@ -508,7 +504,7 @@ function FolderGroup({ folder, feeds, unreadTotal, unreadPerFeed, activeView, on
 }
 
 // ─── Article List ─────────────────────────────────────────────────────────────
-function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedId, onMarkAllRead, filters, onFiltersChange, showAiFilter, onOpenFeedSettings, collapsed, onToggleCollapse, deArrowEnabled }) {
+function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedId, onMarkAllRead, filters, onFiltersChange, showAiFilter, onOpenFeedSettings, collapsed, onToggleCollapse, deArrowEnabled, settings }) {
   const [search, setSearch] = useState('');
   const listScrollRef = useRef(null);
 
@@ -626,24 +622,46 @@ function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedI
       )}
       {displayed.map(item => item.type==='group'
         ? <GroupRow key={`group:${item.clusterId}`} group={item} feeds={feeds} isSelected={selectedId===`group:${item.clusterId}`} onClick={()=>handleSelect({ id:`group:${item.clusterId}`, isGroup:true, clusterId:item.clusterId, members:item.members })} />
-        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} />
+        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} settings={settings} />
       )}
     </div>
   </div>;
 }
 
-function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled }) {
+// Checks a title against both the global blocklist (settings.titleBlocklist
+// — applies across every feed) and a specific feed's own blocklist.
+// Previously only the per-feed one existed anywhere in the filtering code,
+// in three separate near-identical inline try/catch loops; centralizing it
+// here means the global list only has to be threaded into one place per
+// call site instead of duplicating the same regex loop a fourth time.
+function titleIsBlocked(title, feed, settings) {
+  const patterns = [...(settings?.titleBlocklist || []), ...(feed?.titleBlocklist || [])];
+  for (const pattern of patterns) {
+    try { if (new RegExp(pattern, 'i').test(title)) return true; } catch {}
+  }
+  return false;
+}
+
+function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settings }) {
   const [h,setH]=useState(false);
   const isYt=article.isYoutube;
   const dearrow = useDeArrow(isYt ? article.videoId : null, !!deArrowEnabled);
   const displayTitle = (deArrowEnabled && dearrow?.title) ? dearrow.title : article.title;
   const displayThumb = (deArrowEnabled && dearrow?.thumb) ? dearrow.thumb : article.thumbnail;
+  // Per-feed showThumbnail is tri-state: true/false explicitly overrides,
+  // undefined/null inherits the global setting. Previously this was
+  // YouTube-only (isYt && ...) even though thumbnail extraction itself
+  // (see fetchFeed in core/fetcher.js) already pulls media:thumbnail/
+  // enclosure images for any feed that provides them, not just YouTube —
+  // most blogs don't include one, but plenty of podcast/photo-blog feeds
+  // do, and they never got a chance to show it.
+  const showThumb = feed?.showThumbnail ?? settings?.showListThumbnails ?? true;
 
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {isYt&&displayThumb&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+    {showThumb&&displayThumb&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
       <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
-      <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>
-      {deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
+      {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
+      {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
     </div>}
     <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
       <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
@@ -759,8 +777,14 @@ function InlineBrowser({ url, onClose, onNavigateArticle, isMobile, trustedDomai
     const params = new URLSearchParams({ url });
     const token = api.getAuthToken();
     if (token) params.set('token', token);
+    // Ask the linked page for its mobile layout (most sites that do UA
+    // sniffing serve one) when Flux's own layout is currently mobile —
+    // a desktop-styled page crammed into a phone-width iframe is often
+    // unreadable, whereas the mobile layout is usually built for exactly
+    // that width.
+    if (isMobile) params.set('mobile', '1');
     return `/api/proxy?${params.toString()}`;
-  }, [url]);
+  }, [url, isMobile]);
 
   // ── Electron: <webview> wiring ────────────────────────────────────────────
   // No address bar, no history stack — this shows exactly one page (the
@@ -967,6 +991,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
   useEffect(()=>{
     setContent(null); setError(null); setPickMode(false); setRuleWarning(null); setArticleSummary(null);
     setInlineBrow(false); setBrowUrl(null); setBrowStack([]);
+    suppressAutoMarkRef.current = false;
     // Always reset scroll to top — don't carry position from one article
     // to the next or from one view into a completely different article.
     if (readerScrollRef.current) readerScrollRef.current.scrollTop = 0;
@@ -989,10 +1014,18 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
   // them previously meant every article got marked read ~1.2s after
   // opening regardless of whether you actually read it or immediately
   // navigated past it.
+  //
+  // suppressAutoMarkRef: if the user explicitly toggles read/unread via the
+  // toolbar button while the article is open (see handleToggleReadManual
+  // below), that's a deliberate choice and should be the final word — this
+  // stops the cleanup below from unconditionally re-marking it read the
+  // instant they navigate away, which would otherwise silently undo an
+  // explicit "mark unread" within the same visit.
+  const suppressAutoMarkRef = useRef(false);
   useEffect(()=>{
     if (!article || article.isGroup) return;
     const id = article.id, feedId = article.feedId;
-    return () => { onMarkRead(id, feedId); };
+    return () => { if (!suppressAutoMarkRef.current) onMarkRead(id, feedId); };
   },[article?.id, onMarkRead]);
 
   // Closing the tab/window skips the cleanup above in some browsers (the
@@ -1031,7 +1064,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     api.articles.fetch({
       url:         art.link,
       feedId:      art.feedId,
-      rssFallback: { title: art.title, summary: art.summary },
+      rssFallback: { title: art.title, summary: art.summary, content: art.rssContent || null },
     })
       .then(r=>{ setContent(r); setLoading(false); })
       .catch(e=>{ setError(e.message); setLoading(false); });
@@ -1413,6 +1446,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
         <IconBtn icon="→" title="Next (j/→)"     onClick={()=>navigate(1)}  size={28} />
         <Divider vertical margin={4} />
         <IconBtn icon={article.isStarred?'★':'☆'} title="Star" active={article.isStarred} onClick={()=>onToggleStar(article.id,article.feedId,!article.isStarred)} size={28} />
+        <IconBtn icon={article.isRead?'○':'●'} title={article.isRead?'Mark unread':'Mark read'} onClick={()=>{ suppressAutoMarkRef.current = true; onMarkRead(article.id,article.feedId,!article.isRead); }} size={28} />
         <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(article.link)} size={28} />
         <IconBtn icon="◫" title="Inline browser (remembered per feed)"  active={inlineBrow}
           onClick={()=>{
@@ -1447,6 +1481,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
       {isMobile && mobileMoreMenu && (
         <ContextMenu x={mobileMoreMenu.x} y={mobileMoreMenu.y} onClose={()=>setMobileMoreMenu(null)} items={[
           { label: article.isStarred?'Unstar':'Star', icon: article.isStarred?'★':'☆', onClick:()=>onToggleStar(article.id,article.feedId,!article.isStarred) },
+          { label: article.isRead?'Mark unread':'Mark read', icon: article.isRead?'○':'●', onClick:()=>{ suppressAutoMarkRef.current = true; onMarkRead(article.id,article.feedId,!article.isRead); } },
           { label:'Open in default browser', icon:'↗', onClick:()=>api.openExternal(article.link) },
           { divider:true },
           { label:'Inline browser', icon:'◫', onClick:()=>{
@@ -1681,8 +1716,17 @@ function buildSelector(el, container) {
 
   const usableId = (node) => (node.id && !/^\d/.test(node.id) && !/^[a-f0-9]{6,}$/i.test(node.id))
     ? `#${CSS.escape(node.id)}` : null;
+  // Excludes classnames that are likely to be regenerated on the site's
+  // next build/deploy rather than being stable, hand-written names —
+  // picking one of these produces a rule that matches the exact page you
+  // picked it from but nothing afterward, which looks identical to "the
+  // rule just doesn't work." Beyond plain hex hashes and the styled-
+  // components/emotion prefixes already excluded: CSS Modules' typical
+  // `Component_className__hash` suffix pattern, and Next.js's styled-jsx
+  // `jsx-<hash>` classes.
   const usableClasses = (node) => [...node.classList].filter(c=>
-    c.length>1 && !/^[a-f0-9]{5,}$/.test(c) && !/^(css|sc|emotion|styled)-/.test(c) && !/^\d/.test(c));
+    c.length>1 && !/^[a-f0-9]{5,}$/.test(c) && !/^(css|sc|emotion|styled|jsx)-/.test(c) &&
+    !/__[a-z0-9]{5,}$/i.test(c) && !/^\d/.test(c));
 
   // The picked element itself is identifiable — no positional info needed.
   const ownId = usableId(el);
@@ -2106,16 +2150,24 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [editingUrl,setEditingUrl]=useState(false);
   const [url,setUrl]=useState(feed?.url||'');
   const [urlError,setUrlError]=useState(null);
+  const [name,setName]=useState(feed?.name||'');
+  const [showThumbnail,setShowThumbnail]=useState(feed?.showThumbnail===true?'on':feed?.showThumbnail===false?'off':'inherit');
   const save=async()=>{
     setUrlError(null);
+    const trimmedName = name.trim();
+    if (!trimmedName) { setUrlError('Display name can\'t be empty'); return; }
     try {
-      await onSave({feedId:feed.id,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[], ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
+      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],showThumbnail: showThumbnail==='inherit'?null:showThumbnail==='on', ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
       onClose();
     } catch(e) { setUrlError(e.message); }
   };
   return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <div style={{ background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:'10px 14px', fontSize:12, color:T.textMuted, lineHeight:1.6 }}>Rules are applied <strong style={{ color:T.text }}>before</strong> Readability extracts the article.</div>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Display name</label>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Feed name" style={{ width:'100%' }} />
+      </div>
       <div>
         <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Feed URL</label>
         {!editingUrl ? (
@@ -2140,6 +2192,14 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
         </select>
       </div>
       <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser for this feed</label>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead image in article list</label>
+        <select value={showThumbnail} onChange={e=>setShowThumbnail(e.target.value)} style={{ width:'100%' }}>
+          <option value="inherit">Use global setting</option>
+          <option value="on">Always show</option>
+          <option value="off">Never show</option>
+        </select>
+      </div>
       {feed?.isYoutube && (
         <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer', fontSize:13 }}>
           <input type="checkbox" checked={hideShorts} onChange={e=>setHideShorts(e.target.checked)} style={{ width:'auto', padding:0, marginTop:2 }} />
@@ -2306,9 +2366,11 @@ function SettingsModal({ settings, onSave, onClose }) {
   const [strategyOrder, setStrategyOrder] = useState(settings.fetchStrategyOrder?.length ? settings.fetchStrategyOrder : FETCH_STRATEGY_NAMES_FALLBACK);
   const [clusterMaxDaysApart, setClusterMaxDaysApart] = useState(settings.clusterMaxDaysApart ?? 3);
   const [clusterSameSource, setClusterSameSource] = useState(!(settings.clusterExcludeSameSource !== false)); // UI shows the positive framing ("group same-source together")
+  const [titleBlocklist, setTitleBlocklist] = useState((settings.titleBlocklist || []).join('\n'));
+  const [showListThumbnails, setShowListThumbnails] = useState(settings.showListThumbnails ?? true);
 
   const save = async () => {
-    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource });
+    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), showListThumbnails });
     onClose();
   };
 
@@ -2356,6 +2418,14 @@ function SettingsModal({ settings, onSave, onClose }) {
               ? "Ollama will be started automatically when you use an AI feature, without asking first. It'll be stopped when done."
               : "When you use an AI feature, Flux will ask before starting Ollama. Turn this on to skip the prompt."} />
         </div>
+      </div>
+
+      <Divider margin={2} />
+
+      <div>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:10 }}>Display</div>
+        <Toggle checked={showListThumbnails} onChange={setShowListThumbnails} title="Lead images in article list"
+          desc="Shows each article's thumbnail/lead image in the list, when the feed provides one. Previously YouTube-only; now applies to any feed with a media:thumbnail or enclosure image. Individual feeds can override this in their feed settings." />
       </div>
 
       <Divider margin={2} />
@@ -2415,6 +2485,16 @@ function SettingsModal({ settings, onSave, onClose }) {
           override this in their feed settings.
         </div>
         <StrategyOrderPicker order={strategyOrder} onChange={setStrategyOrder} />
+      </div>
+
+      <Divider margin={2} />
+
+      <div>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:6 }}>Filtering</div>
+        <div style={{ fontSize:11, color:T.textMuted, marginBottom:8, lineHeight:1.5 }}>
+          Hide articles whose title matches any of these patterns (one per line, case-insensitive regex), across every feed. For a single feed only, use that feed's own settings instead — this list is combined with, not a replacement for, per-feed blocklists.
+        </div>
+        <textarea value={titleBlocklist} onChange={e=>setTitleBlocklist(e.target.value)} placeholder={`^\\[Sponsor\\]\nSponsored Post`} style={{ width:'100%', height:60, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
       </div>
 
       {api.isRemoteHttp() && <AccountSection />}
@@ -2736,13 +2816,33 @@ function FilterBar({ filters, onChange, feedsInView, showAiFilter }) {
 }
 
 // ─── Mobile breakpoint hook ───────────────────────────────────────────────────
+// Checks the SHORTER of the two viewport dimensions rather than raw width.
+// A phone's short side is physically fixed regardless of orientation — only
+// which axis (width vs height) it's currently measured on changes when you
+// rotate — so this stays stable across rotation. Checking width alone
+// doesn't: many phones' landscape width exceeds typical breakpoints (an
+// iPhone Pro is ~393px wide in portrait but ~852px in landscape, well past
+// any reasonable "mobile" cutoff), so a plain `innerWidth < 768` check would
+// flip `mobile` to false the instant you rotated to landscape. Since the
+// top-level render swaps between MobileLayout and the full 3-pane desktop
+// layout based on this value (see `if (isMobile) return <MobileLayout .../>`
+// below), that flip unmounts the entire mobile navigation stack mid-
+// rotation — which is exactly what "rotating during YouTube fullscreen
+// kicks you back to the feed view" was: not a video-player or fullscreen
+// bug at all, just the layout itself swapping out from under it.
 function useIsMobile() {
-  const [mobile, setMobile] = useState(()=>window.innerWidth < 768);
+  const getIsMobile = () => Math.min(window.innerWidth, window.innerHeight) < 768;
+  const [mobile, setMobile] = useState(getIsMobile);
   useEffect(()=>{
-    const mq = window.matchMedia('(max-width: 767px)');
-    const h = (e) => setMobile(e.matches);
-    mq.addEventListener('change', h);
-    return ()=>mq.removeEventListener('change', h);
+    // matchMedia's 'change' event only fires when that one query's own
+    // match state changes — it can't express "shorter dimension," so this
+    // recomputes directly off a resize listener instead (rotation fires
+    // resize same as any other viewport change, no separate handling
+    // needed for it specifically).
+    const h = () => setMobile(getIsMobile());
+    window.addEventListener('resize', h);
+    window.addEventListener('orientationchange', h);
+    return ()=>{ window.removeEventListener('resize', h); window.removeEventListener('orientationchange', h); };
   },[]);
   return mobile;
 }
@@ -2998,7 +3098,7 @@ function MobileLayout({
       <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', paddingBottom:56 }}>
         {visibleArticles.length===0 && <div style={{ padding:40, textAlign:'center', color:T.textSubtle }}>Nothing here.</div>}
         {visibleArticles.map(a => (
-          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} isSelected={false} onClick={()=>goToArticle(a)} />
+          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} isSelected={false} onClick={()=>goToArticle(a)} settings={settings} />
         ))}
       </div>
     </div>
@@ -3365,17 +3465,23 @@ export default function App() {
     const mins = settings.refreshIntervalMinutes ?? 30;
     if (!mins || mins < 1 || feeds_.length === 0) return;
     autoRefreshRef.current = setInterval(async ()=>{
-      const prevCount = articles.length;
+      // Diffing by ID set rather than array length — length delta breaks
+      // in two common, opposite ways: (1) a feed that only keeps its last
+      // N items rolling old ones off the same moment new ones arrive nets
+      // to zero length change even with several genuinely new articles
+      // (undercounts, sometimes to exactly zero); (2) a feed recovering
+      // from a previous transient fetch failure suddenly contributes all
+      // its items at once, none of which are actually new (overcounts).
+      // Comparing which IDs are new is correct regardless of what else
+      // simultaneously changed in feed contents.
+      const prevIds = new Set(articlesRef.current.map(a=>a.id));
       const state = await api.articles.getState();
       await refreshFeeds(feeds_, state);
-      // Brief delay so refreshFeeds has settled
-      setTimeout(()=>{
-        setArticles(curr => {
-          const diff = curr.length - prevCount;
-          if (diff > 0) setNewArticleCount(n => n + diff);
-          return curr;
-        });
-      }, 500);
+      setArticles(curr => {
+        const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
+        if (newCount > 0) setNewArticleCount(n => n + newCount);
+        return curr;
+      });
     }, mins * 60 * 1000);
     return () => clearInterval(autoRefreshRef.current);
   },[settings.refreshIntervalMinutes, feeds_.length]);
@@ -3463,9 +3569,9 @@ export default function App() {
       console.warn(`[flux] failed to persist ${label} after retry — it may revert on reload:`, e);
     }
   },[]);
-  const handleMarkRead = useCallback(async(articleId, feedId)=>{
-    setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isRead:true}:a));
-    await persistWithRetry(() => api.articles.markRead({articleId, feedId}), 'read state');
+  const handleMarkRead = useCallback(async(articleId, feedId, read=true)=>{
+    setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isRead:read}:a));
+    await persistWithRetry(() => api.articles.markRead({articleId, feedId, read}), 'read state');
   },[persistWithRetry]);
   const handleToggleStar  = useCallback(async(articleId, feedId, starred)=>{
     setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isStarred:starred}:a));
@@ -3502,18 +3608,13 @@ export default function App() {
     else if (activeView.startsWith('folder:')){ const fid=activeView.slice(7); result = articles.filter(a=>feeds_.find(f=>f.id===a.feedId)?.folder===fid); }
     else result = articles;
 
-    // Per-feed "hide shorts" and title-blocklist filtering — applied
-    // regardless of other view/status filters, since these represent
-    // "never show me this" rather than a temporary view toggle.
+    // Global + per-feed "hide shorts" and title-blocklist filtering —
+    // applied regardless of other view/status filters, since these
+    // represent "never show me this" rather than a temporary view toggle.
     result = result.filter(a=>{
       const feed = feeds_.find(f=>f.id===a.feedId);
       if (feed?.hideShorts && a.isShort) return false;
-      if (feed?.titleBlocklist?.length) {
-        for (const pattern of feed.titleBlocklist) {
-          try { if (new RegExp(pattern, 'i').test(a.title)) return false; }
-          catch { /* invalid regex in the blocklist — ignore rather than crash filtering */ }
-        }
-      }
+      if (titleIsBlocked(a.title, feed, settings)) return false;
       return true;
     });
 
@@ -3534,9 +3635,9 @@ export default function App() {
   const baseFilteredArticles = useMemo(()=>articles.filter(a=>{
     const feed=feeds_.find(f=>f.id===a.feedId);
     if (feed?.hideShorts&&a.isShort) return false;
-    if (feed?.titleBlocklist?.length) for (const p of feed.titleBlocklist) { try { if(new RegExp(p,'i').test(a.title)) return false; } catch {} }
+    if (titleIsBlocked(a.title, feed, settings)) return false;
     return true;
-  }),[articles,feeds_]);
+  }),[articles,feeds_,settings]);
 
   // Marks only the articles currently visible (respecting whatever
   // folder/feed/filter view is active) as read — not every article in the
@@ -3611,7 +3712,7 @@ export default function App() {
     <SpeedInsights />
     <div style={{ display:'flex', height:'100vh', overflow:'hidden' }}>
       <Sidebar folders={folders_} feeds={feeds_} articles={articles} activeView={activeView} onSelectView={(v)=>{ setActiveView(v); setArticleListCollapsed(false); }} onOpenAddFeed={(folder)=>setShowAddFeed(folder&&folder.id?folder:true)} onAddToFolder={(folder)=>setAddToFolderTarget(folder)} onRefreshAll={handleRefreshAll} refreshing={refreshing} onExportOPML={handleExportOPML} onImportOPML={handleImportOPML} onNewFolder={()=>setShowNewFolder(true)} onOpenSettings={()=>setShowSettings(true)} onFeedSettings={setRulesTarget} onRemoveFeed={handleRemoveFeed} onRemoveFolder={handleRemoveFolder} onManageFolderFeeds={setManageFolderTarget} newArticleCount={newArticleCount} settings={settings} onReorderFolders={handleReorderFolders} onEditFolder={setEditFolderTarget} />
-      <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} />
+      <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} settings={settings} />
       <ReaderPane article={selectedArticle} feed={feeds_.find(f=>f.id===selectedArticle?.feedId)} allArticles={visibleArticles} allFeeds={feeds_} onNavigate={setSelectedArticle} onMarkRead={handleMarkRead} onToggleStar={handleToggleStar} onOpenRules={setRulesTarget} onSaveRule={handleSaveRules} onSaveSettings={handleSaveSettings} settings={settings} />
     </div>
 

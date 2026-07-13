@@ -32,6 +32,7 @@ function camelFeed(row) {
     isYoutube: row.is_youtube, inlineBrowser: row.inline_browser, hideShorts: row.hide_shorts,
     cssSelectors: row.css_selectors || [], htmlPatterns: row.html_patterns || [], favicon: row.favicon,
     titleBlocklist: row.title_blocklist || [], fetchStrategyOrder: row.fetch_strategy_order || [],
+    showThumbnail: row.show_thumbnail,
   };
 }
 function feedToRow(feed) {
@@ -47,6 +48,7 @@ function feedToRow(feed) {
   if ('favicon' in feed) row.favicon = feed.favicon;
   if ('titleBlocklist' in feed) row.title_blocklist = feed.titleBlocklist;
   if ('fetchStrategyOrder' in feed) row.fetch_strategy_order = feed.fetchStrategyOrder;
+  if ('showThumbnail' in feed) row.show_thumbnail = feed.showThumbnail;
   return row;
 }
 function camelUser(row) {
@@ -251,8 +253,8 @@ class SupabaseStore {
     const rows = data || [];
     return { read: rows.filter(r => r.is_read).map(r => r.key), starred: rows.filter(r => r.is_starred).map(r => r.key) };
   }
-  async markRead(userId, key) {
-    const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: true }, { onConflict: 'key,user_id' });
+  async markRead(userId, key, read = true) {
+    const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: read }, { onConflict: 'key,user_id' });
     this._throw(error, 'markRead');
   }
   // Bulk variant for "mark all read" — previously the client fired one

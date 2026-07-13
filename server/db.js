@@ -257,10 +257,10 @@ class JSONStore {
       starred: rows.filter(r => r.isStarred).map(r => r.key),
     };
   }
-  markRead(userId, key) {
+  markRead(userId, key, read = true) {
     let row = this.data.articleState.find(r => r.userId === userId && r.key === key);
     if (!row) { row = { key, userId, isRead: false, isStarred: false }; this.data.articleState.push(row); }
-    row.isRead = true;
+    row.isRead = read;
     this._save();
   }
   // Bulk variant for "mark all read" — see the matching comment in
