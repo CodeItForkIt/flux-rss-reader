@@ -648,33 +648,58 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   const dearrow = useDeArrow(isYt ? article.videoId : null, !!deArrowEnabled);
   const displayTitle = (deArrowEnabled && dearrow?.title) ? dearrow.title : article.title;
   const displayThumb = (deArrowEnabled && dearrow?.thumb) ? dearrow.thumb : article.thumbnail;
-  // Per-feed showThumbnail is tri-state: true/false explicitly overrides,
-  // undefined/null inherits the global setting. Previously this was
-  // YouTube-only (isYt && ...) even though thumbnail extraction itself
-  // (see fetchFeed in core/fetcher.js) already pulls media:thumbnail/
-  // enclosure images for any feed that provides them, not just YouTube —
-  // most blogs don't include one, but plenty of podcast/photo-blog feeds
-  // do, and they never got a chance to show it.
-  const showThumb = feed?.showThumbnail ?? settings?.showListThumbnails ?? true;
+  // Per-feed thumbnailMode overrides the global setting; null/undefined
+  // inherits it. Previously this was YouTube-only even though thumbnail
+  // extraction itself (see fetchFeed in core/fetcher.js) already pulls
+  // media:thumbnail/enclosure images for any feed that provides one, not
+  // just YouTube — most blogs don't include one, but plenty of podcast/
+  // photo-blog feeds do, and they never got a chance to show it. 'large'
+  // is the default, matching the only style that existed before this was
+  // configurable.
+  const mode = feed?.thumbnailMode || settings?.listThumbnailMode || 'large';
+  const showThumb = mode !== 'none' && !!displayThumb;
+
+  const metaRow = <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
+    <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
+    {isYt&&article.duration&&<Badge tone="yt" tiny>▶ {article.duration}</Badge>}
+    {article.clusterId&&<Badge tone="ai" tiny>◆ {article.clusterSize}</Badge>}
+    {feed?.inlineBrowser&&<Badge tone="muted" tiny>inline</Badge>}
+    {deArrowEnabled&&dearrow?.title&&<Badge tone="muted" tiny>DeArrow</Badge>}
+    <span style={{ flex:1 }} />
+    {!article.isRead&&<div style={{ width:6, height:6, borderRadius:'50%', background:isYt?T.youtube:T.accent, flexShrink:0 }} />}
+    <span style={{ fontSize:10, color:T.textSubtle }}>{timeAgo(article.date)}</span>
+  </div>;
+  const titleEl = <div style={{ fontSize:13, fontWeight:article.isRead?400:600, color:article.isRead?T.textMuted:T.text, lineHeight:1.4, marginBottom:4, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{displayTitle}</div>;
+  const summaryEl = article.summary&&<div style={{ fontSize:12, color:T.textMuted, lineHeight:1.45, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{article.summary}</div>;
+
+  // 'large': image above the title, full width. Height is explicitly
+  // capped (not just aspect-ratio-derived) — previously this was
+  // width:100% + aspectRatio:16/9 with no ceiling at all, so in a wide
+  // article-list column (a maximized window, a collapsed sidebar, a
+  // tablet) the image could scale up to a genuinely oversized block that
+  // dwarfed the actual text content it was supposed to be a preview for.
+  const largeThumb = showThumb && <div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
+    {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
+  </div>;
+
+  // 'small': a fixed square thumbnail beside the title/meta/summary block,
+  // the compact layout style most readers (Reeder, NetNewsWire, etc.) use.
+  const smallThumb = showThumb && <div style={{ width:52, height:52, borderRadius:6, overflow:'hidden', background:T.bg, flexShrink:0, position:'relative' }}>
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:18, height:18, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:8 }}>▶</div></div>}
+  </div>;
 
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {showThumb&&displayThumb&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-      <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
-      {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
-      {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
-    </div>}
-    <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
-      <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
-      {isYt&&article.duration&&<Badge tone="yt" tiny>▶ {article.duration}</Badge>}
-      {article.clusterId&&<Badge tone="ai" tiny>◆ {article.clusterSize}</Badge>}
-      {feed?.inlineBrowser&&<Badge tone="muted" tiny>inline</Badge>}
-      {deArrowEnabled&&dearrow?.title&&<Badge tone="muted" tiny>DeArrow</Badge>}
-      <span style={{ flex:1 }} />
-      {!article.isRead&&<div style={{ width:6, height:6, borderRadius:'50%', background:isYt?T.youtube:T.accent, flexShrink:0 }} />}
-      <span style={{ fontSize:10, color:T.textSubtle }}>{timeAgo(article.date)}</span>
-    </div>
-    <div style={{ fontSize:13, fontWeight:article.isRead?400:600, color:article.isRead?T.textMuted:T.text, lineHeight:1.4, marginBottom:4, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{displayTitle}</div>
-    {article.summary&&<div style={{ fontSize:12, color:T.textMuted, lineHeight:1.45, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{article.summary}</div>}
+    {mode==='small' ? (
+      <div style={{ display:'flex', gap:10 }}>
+        {smallThumb}
+        <div style={{ flex:1, minWidth:0 }}>{metaRow}{titleEl}{summaryEl}</div>
+      </div>
+    ) : (
+      <>{largeThumb}{metaRow}{titleEl}{summaryEl}</>
+    )}
     {article.isStarred&&<span style={{ position:'absolute', bottom:10, right:12, fontSize:11, color:T.warning }}>★</span>}
   </div>;
 }
@@ -686,7 +711,7 @@ function GroupRow({ group, feeds, isSelected, onClick }) {
   const sourceNames = [...new Set(group.members.map(m=>feeds.find(f=>f.id===m.feedId)?.name || domainOf(m.link)))];
   const anyUnread = group.members.some(m=>!m.isRead);
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {isYt&&top.thumbnail&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+    {isYt&&top.thumbnail&&<div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
       <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
     </div>}
     <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
@@ -2151,13 +2176,13 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [url,setUrl]=useState(feed?.url||'');
   const [urlError,setUrlError]=useState(null);
   const [name,setName]=useState(feed?.name||'');
-  const [showThumbnail,setShowThumbnail]=useState(feed?.showThumbnail===true?'on':feed?.showThumbnail===false?'off':'inherit');
+  const [thumbnailMode,setThumbnailMode]=useState(feed?.thumbnailMode||'inherit');
   const save=async()=>{
     setUrlError(null);
     const trimmedName = name.trim();
     if (!trimmedName) { setUrlError('Display name can\'t be empty'); return; }
     try {
-      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],showThumbnail: showThumbnail==='inherit'?null:showThumbnail==='on', ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
+      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode, ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
       onClose();
     } catch(e) { setUrlError(e.message); }
   };
@@ -2194,10 +2219,11 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
       <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser for this feed</label>
       <div>
         <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead image in article list</label>
-        <select value={showThumbnail} onChange={e=>setShowThumbnail(e.target.value)} style={{ width:'100%' }}>
+        <select value={thumbnailMode} onChange={e=>setThumbnailMode(e.target.value)} style={{ width:'100%' }}>
           <option value="inherit">Use global setting</option>
-          <option value="on">Always show</option>
-          <option value="off">Never show</option>
+          <option value="large">Above title, large</option>
+          <option value="small">Beside title, small</option>
+          <option value="none">Not at all</option>
         </select>
       </div>
       {feed?.isYoutube && (
@@ -2367,10 +2393,10 @@ function SettingsModal({ settings, onSave, onClose }) {
   const [clusterMaxDaysApart, setClusterMaxDaysApart] = useState(settings.clusterMaxDaysApart ?? 3);
   const [clusterSameSource, setClusterSameSource] = useState(!(settings.clusterExcludeSameSource !== false)); // UI shows the positive framing ("group same-source together")
   const [titleBlocklist, setTitleBlocklist] = useState((settings.titleBlocklist || []).join('\n'));
-  const [showListThumbnails, setShowListThumbnails] = useState(settings.showListThumbnails ?? true);
+  const [listThumbnailMode, setListThumbnailMode] = useState(settings.listThumbnailMode || 'large');
 
   const save = async () => {
-    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), showListThumbnails });
+    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), listThumbnailMode });
     onClose();
   };
 
@@ -2424,8 +2450,15 @@ function SettingsModal({ settings, onSave, onClose }) {
 
       <div>
         <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:10 }}>Display</div>
-        <Toggle checked={showListThumbnails} onChange={setShowListThumbnails} title="Lead images in article list"
-          desc="Shows each article's thumbnail/lead image in the list, when the feed provides one. Previously YouTube-only; now applies to any feed with a media:thumbnail or enclosure image. Individual feeds can override this in their feed settings." />
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead images in article list</label>
+        <div style={{ fontSize:11, color:T.textMuted, marginBottom:8, lineHeight:1.5 }}>
+          Shows each article's thumbnail/lead image in the list, when the feed provides one (any feed with a media:thumbnail or enclosure image — not just YouTube). Individual feeds can override this in their own feed settings.
+        </div>
+        <select value={listThumbnailMode} onChange={e=>setListThumbnailMode(e.target.value)} style={{ width:'100%' }}>
+          <option value="large">Above title, large</option>
+          <option value="small">Beside title, small</option>
+          <option value="none">Not at all</option>
+        </select>
       </div>
 
       <Divider margin={2} />

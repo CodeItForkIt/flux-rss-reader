@@ -123,6 +123,29 @@ const articleCache = {
   entries: () => db.cacheEntries(),
 };
 
+// Article *content* specifically (not the feed cache or video-duration
+// cache above/below, which use their own distinct key prefixes and aren't
+// affected by fetchArticle's logic) is keyed through this version wrapper.
+// Bump ARTICLE_CONTENT_CACHE_VERSION whenever a change to fetchArticle
+// could change what gets returned for the same URL — the old versioned
+// keys are simply never looked up again, so every previously-cached entry
+// is effectively invalidated without needing to enumerate and delete them,
+// and without waiting out the (up to 7-day-by-default) TTL. Current bump:
+// fetchArticle now prefers substantial RSS-provided content over live-
+// fetching <link> for feeds like Daring Fireball's Linked List, where
+// <link> points at an unrelated external site — any article fetched
+// before this change has the *old*, wrong result cached under the
+// unversioned key, which would otherwise keep being served until it
+// naturally expired.
+// Current bump: added teaser detection (looksLikeTeaser in core/fetcher.js)
+// on top of the plain length check from version 2 — that version-2 logic
+// is what caused The Verge (and any other publisher who deliberately
+// truncates their feed content with a "Read more" CTA) to regress, since
+// their teaser is long enough to clear a size-only bar. Articles cached
+// under version 2 have that wrongly-truncated result baked in.
+const ARTICLE_CONTENT_CACHE_VERSION = 3;
+const articleContentCacheKey = (url) => `v${ARTICLE_CONTENT_CACHE_VERSION}::${url}`;
+
 // getSettings() is called on nearly every article-fetch request just to
 // look up articleCacheDays/fetchStrategyOrder — that's a full Supabase
 // round-trip before the actual cache lookup even starts, on every single
@@ -362,6 +385,26 @@ app.use(cors(
 ));
 app.use(express.json({ limit: '2mb' }));
 
+// Every response under /api/ reflects live, mutable, per-user state (read/
+// starred status, feed list, settings, article content) — nothing here
+// should ever be served from a cache at any layer (the browser, Vercel's
+// edge network, or any intermediate proxy). Previously NOTHING in this
+// file set any Cache-Control header at all, on any route, which leaves
+// every GET endpoint cacheable by default wherever a caching layer sits
+// between the browser and this server. GET /api/articles/state in
+// particular reads back exactly what mark-read/mark-read-bulk just wrote —
+// if that read is served from a stale cache on the next page load, a
+// write that genuinely succeeded server-side would still look like it
+// "didn't persist," which is indistinguishable from the write itself
+// having failed without checking network traffic directly. Setting this
+// unconditionally, before any route runs, removes that possibility
+// entirely rather than trying to guess which specific layer might be
+// responsible for caching it.
+app.use('/api/', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  next();
+});
+
 // Generous global limiter (guards against runaway clients/scripted abuse);
 // tighter limiter specifically on auth to slow down password guessing.
 // Both skip entirely for local/private-network requests and can be turned
@@ -557,7 +600,8 @@ const feedRow = (f) => ({
   favicon:       f.favicon || null,
   titleBlocklist: f.titleBlocklist || [],
   fetchStrategyOrder: f.fetchStrategyOrder || [],
-  showThumbnail: f.showThumbnail === true ? true : f.showThumbnail === false ? false : null,
+  showThumbnail: f.showThumbnail === true ? true : f.showThumbnail === false ? false : null, // deprecated, superseded by thumbnailMode below — kept read-only for any already-set rows
+  thumbnailMode: f.thumbnailMode || null, // null = inherit global setting; 'large' | 'small' | 'none' = explicit override
   autoRefreshEnabled: f.autoRefreshEnabled !== false,
 });
 
@@ -617,7 +661,7 @@ app.post('/api/feeds', async (req, res) => {
   res.json(feedRow(feed));
 });
 app.patch('/api/feeds/:id', async (req, res) => {
-  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail } = req.body;
+  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail, thumbnailMode } = req.body;
   const patch = {};
   if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
   if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -632,6 +676,7 @@ app.patch('/api/feeds/:id', async (req, res) => {
   // global setting" — all three are meaningful, so this checks `!==
   // undefined` (missing from the request at all) rather than truthiness.
   if (showThumbnail !== undefined) patch.showThumbnail = showThumbnail;
+  if (thumbnailMode !== undefined) patch.thumbnailMode = thumbnailMode;
   if (url !== undefined) {
     let newUrl = url.trim();
     if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
@@ -649,10 +694,15 @@ app.patch('/api/feeds/:id', async (req, res) => {
   }
   const feed = await db.updateFeed(req.userId, req.params.id, patch);
   if (!feed) return res.status(404).json({ error: 'Not found' });
-  // Changing the URL invalidates any cached content fetched under the old
-  // one — without this, the reader would keep showing old-feed content
-  // (or errors from it) until the cache TTL happens to expire on its own.
-  if (url !== undefined) await articleCache.delete(feed.url);
+  // Changing the URL invalidates this feed's cached content — without
+  // this, fetchFeedCached would keep serving whatever was fetched under
+  // the old URL until the feed-cache TTL happens to expire on its own.
+  // Note: this targets the *feed* cache (flux-feed-cache::userId::feedId),
+  // not the article-content cache — a feed's own URL was never actually
+  // how article content gets cached, so deleting by feed.url here
+  // previously did nothing at all (stale from before the feed-cache
+  // existed as its own keyed store).
+  if (url !== undefined) await articleCache.delete(feedCacheKey(req.userId, feed.id));
   // Bust the article cache when block rules change — see the matching
   // comment in src/main/index.js's feeds:updateRules handler for why this
   // matters (otherwise the element picker's verification step checks
@@ -702,12 +752,13 @@ app.post('/api/feeds/:id/fetch', async (req, res) => {
 app.post('/api/article/fetch', async (req, res) => {
   const { url, feedId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
+  const cacheKey = articleContentCacheKey(url);
 
   // These two are independent reads — previously sequential (ttl, then
   // cache), meaning every single article open paid for two round-trips
   // back-to-back before any actual work started. articleTtlMs also now
   // goes through getSettingsCached rather than hitting Supabase directly.
-  const [ttl, cached] = await Promise.all([articleTtlMs(req.userId), articleCache.get(url)]);
+  const [ttl, cached] = await Promise.all([articleTtlMs(req.userId), articleCache.get(cacheKey)]);
   if (cached && Date.now() - cached.ts < ttl) return res.json(cached.result);
 
   const feed = feedId ? await db.findFeed(req.userId, feedId) : null;
@@ -718,7 +769,7 @@ app.post('/api/article/fetch', async (req, res) => {
   }
   try {
     const result = await fetchArticle(url, feedRowData, cookieJars, rssFallback);
-    await articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
+    await articleCache.set(cacheKey, { ts: Date.now(), feedId: feedId || null, result });
     res.json(result);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -726,7 +777,7 @@ app.post('/api/article/fetch', async (req, res) => {
 app.post('/api/article/clear-cache', async (req, res) => {
   const { url } = req.body || {};
   if (url) {
-    await articleCache.delete(url);
+    await articleCache.delete(articleContentCacheKey(url));
   } else {
     for (const [key] of await articleCache.entries()) await articleCache.delete(key);
   }

@@ -54,7 +54,8 @@ create table if not exists feeds (
   favicon                text,
   title_blocklist        jsonb default '[]',
   fetch_strategy_order   jsonb default '[]',
-  show_thumbnail         boolean
+  show_thumbnail         boolean,
+  thumbnail_mode         text
 );
 create index if not exists feeds_user_id_idx on feeds (user_id);
 

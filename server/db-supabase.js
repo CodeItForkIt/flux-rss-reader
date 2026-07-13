@@ -33,6 +33,7 @@ function camelFeed(row) {
     cssSelectors: row.css_selectors || [], htmlPatterns: row.html_patterns || [], favicon: row.favicon,
     titleBlocklist: row.title_blocklist || [], fetchStrategyOrder: row.fetch_strategy_order || [],
     showThumbnail: row.show_thumbnail,
+    thumbnailMode: row.thumbnail_mode,
   };
 }
 function feedToRow(feed) {
@@ -49,6 +50,7 @@ function feedToRow(feed) {
   if ('titleBlocklist' in feed) row.title_blocklist = feed.titleBlocklist;
   if ('fetchStrategyOrder' in feed) row.fetch_strategy_order = feed.fetchStrategyOrder;
   if ('showThumbnail' in feed) row.show_thumbnail = feed.showThumbnail;
+  if ('thumbnailMode' in feed) row.thumbnail_mode = feed.thumbnailMode;
   return row;
 }
 function camelUser(row) {

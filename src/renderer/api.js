@@ -46,6 +46,10 @@ async function http(method, path, body, isFormData = false) {
   const resp = await fetch(httpBase() + path, {
     method,
     headers,
+    // Every API response is live per-user state — never let the browser's
+    // own HTTP cache serve a stale one, on top of the server's
+    // Cache-Control: no-store response header (see server/index.js).
+    cache: 'no-store',
     body: isFormData ? body : (body ? JSON.stringify(body) : undefined),
   });
   if (resp.status === 401) {
