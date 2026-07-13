@@ -32,6 +32,8 @@ function camelFeed(row) {
     isYoutube: row.is_youtube, inlineBrowser: row.inline_browser, hideShorts: row.hide_shorts,
     cssSelectors: row.css_selectors || [], htmlPatterns: row.html_patterns || [], favicon: row.favicon,
     titleBlocklist: row.title_blocklist || [], fetchStrategyOrder: row.fetch_strategy_order || [],
+    showThumbnail: row.show_thumbnail,
+    thumbnailMode: row.thumbnail_mode,
   };
 }
 function feedToRow(feed) {
@@ -47,6 +49,8 @@ function feedToRow(feed) {
   if ('favicon' in feed) row.favicon = feed.favicon;
   if ('titleBlocklist' in feed) row.title_blocklist = feed.titleBlocklist;
   if ('fetchStrategyOrder' in feed) row.fetch_strategy_order = feed.fetchStrategyOrder;
+  if ('showThumbnail' in feed) row.show_thumbnail = feed.showThumbnail;
+  if ('thumbnailMode' in feed) row.thumbnail_mode = feed.thumbnailMode;
   return row;
 }
 function camelUser(row) {
@@ -251,9 +255,25 @@ class SupabaseStore {
     const rows = data || [];
     return { read: rows.filter(r => r.is_read).map(r => r.key), starred: rows.filter(r => r.is_starred).map(r => r.key) };
   }
-  async markRead(userId, key) {
-    const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: true }, { onConflict: 'key,user_id' });
+  async markRead(userId, key, read = true) {
+    const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: read }, { onConflict: 'key,user_id' });
     this._throw(error, 'markRead');
+  }
+  // Bulk variant for "mark all read" — previously the client fired one
+  // HTTP request + one upsert per article (potentially hundreds at once
+  // for a big unread pile). Besides being slow, a burst that size has a
+  // real chance of a handful of requests failing under Supabase's
+  // connection-pool limits or transient network blips — and with nothing
+  // retrying those individually-failed writes, the articles they belonged
+  // to would quietly revert to unread on the next reload. A single upsert
+  // with all rows is one round-trip and one statement: either all of it
+  // lands or the caller gets one clear error to retry, not a partial,
+  // silent failure spread across N independent requests.
+  async markReadBulk(userId, keys) {
+    if (!keys.length) return;
+    const rows = keys.map(key => ({ key, user_id: userId, is_read: true }));
+    const { error } = await this.sb.from('article_state').upsert(rows, { onConflict: 'key,user_id' });
+    this._throw(error, 'markReadBulk');
   }
   async toggleStar(userId, key, starred) {
     const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_starred: !!starred }, { onConflict: 'key,user_id' });

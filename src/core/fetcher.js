@@ -54,6 +54,12 @@ function getCookieJar(domain, jars) {
 
 // ─── HTTP fetch with cookie jar ───────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// Used by the inline-browser proxy when the requesting Flux client is
+// itself on a mobile viewport (see the `mobile=1` query param on
+// /api/proxy in server/index.js) — a page rendered in its desktop layout
+// inside a phone-width iframe is often unreadable, whereas most sites that
+// do UA-sniffing serve a purpose-built, narrower mobile layout instead.
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
 async function fetchWithCookies(url, opts = {}, cookieJars) {
   await loadDeps();
@@ -104,46 +110,107 @@ async function fetchWithCookies(url, opts = {}, cookieJars) {
   return resp;
 }
 
+// Bare _fetch() calls (archive.ph and googlebot-ua below) previously had NO
+// timeout at all — unlike fetchWithCookies, which has always aborted at
+// 15s. A hung connection to either host could stall an article-open
+// indefinitely. This gives any fetch the same abort-based timeout.
+// Thrown by a fetch strategy when the response's actual Content-Type header
+// says this isn't HTML at all — checked before decoding as text, which
+// matters: unlike PDF's %PDF- signature (plain ASCII, survives UTF-8
+// decoding, so the existing magic-byte check on the decoded string further
+// down still works for that case), image formats' magic bytes are
+// non-ASCII and get mangled into replacement characters by the time
+// resp.text() has decoded them — a string-based check after the fact
+// can't reliably detect an image, so this has to happen at the header
+// level, before decoding.
+class NonHtmlContentError extends Error {
+  constructor(contentType, url) { super(`Non-HTML content-type: ${contentType}`); this.contentType = contentType; this.sourceUrl = url; }
+}
+
+async function withTimeout(url, opts, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await _fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Paywall bypass chain ─────────────────────────────────────────────────────
 // Each strategy: { name, minLength, run(url, cookieJars) -> html|null }
 // Exported so Settings/FeedRules UI can list available strategies by name.
+//
+// Per-strategy timeouts are staggered and shrink down the fallback chain:
+// 'direct' is the common case and gets the most patience, while later
+// strategies are already a degraded fallback path, so a slow one shouldn't
+// eat as much of the budget. Worst case (all four fail slowly) is bounded
+// to ~26s, leaving headroom under Vercel's 30s function maxDuration for
+// the readability/cheerio pass that runs afterward.
 const FETCH_STRATEGIES = {
   direct: {
     minLength: 5000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(url, {}, cookieJars);
+      const resp = await fetchWithCookies(url, { timeoutMs: 8000 }, cookieJars);
+      if (!resp.ok) return null;
+      const ct = resp.headers.get('content-type') || '';
+      // A feed's <link> can point straight at a non-HTML file — most
+      // commonly an image (photo-blog/Tumblr-style feeds, direct
+      // image-host links) or a PDF (the PDF case is caught further down
+      // in fetchArticle via its magic-byte signature, since %PDF- is
+      // plain ASCII and survives being decoded as text; images aren't so
+      // this has to be caught here instead, before decoding).
+      if (ct.startsWith('image/')) throw new NonHtmlContentError(ct, url);
+      return await resp.text();
+    },
+  },
+  // Distinct from 'direct' only in sending a Google-search Referer header.
+  // Several paywalled/gift-link publications (WSJ, and others historically)
+  // intentionally grant full access to traffic that appears to arrive from
+  // a Google search result — well-documented SEO practice, since blocking
+  // Google's own crawler or search-referred readers hurts a site's search
+  // ranking and click-through. A referral link shared via a blog or feed
+  // (a Daring Fireball Linked List item, for instance) doesn't carry that
+  // referer on a direct server-side fetch the way a browser navigation
+  // would, so gift-link articles could hit the real paywall despite being
+  // freely readable when actually clicked through from the source page.
+  'google-referer': {
+    minLength: 5000,
+    run: async (url, cookieJars) => {
+      const resp = await fetchWithCookies(url, { timeoutMs: 5000, headers: { Referer: 'https://www.google.com/' } }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   '12ft.io': {
     minLength: 3000,
     run: async (url, cookieJars) => {
-      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, {}, cookieJars);
+      const resp = await fetchWithCookies(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, { timeoutMs: 5000 }, cookieJars);
       return resp.ok ? await resp.text() : null;
     },
   },
   'archive.ph': {
     minLength: 3000,
     run: async (url) => {
-      const resp = await _fetch(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' });
+      const resp = await withTimeout(`https://archive.ph/newest/${url}`, { headers: { 'User-Agent': UA }, redirect: 'follow' }, 5000);
       return resp.ok ? await resp.text() : null;
     },
   },
   'googlebot-ua': {
     minLength: 5000,
     run: async (url) => {
-      const resp = await _fetch(url, {
+      const resp = await withTimeout(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Referer': 'https://www.google.com/',
         },
         redirect: 'follow',
-      });
+      }, 4000);
       return resp.ok ? await resp.text() : null;
     },
   },
 };
-const DEFAULT_STRATEGY_ORDER = ['direct', '12ft.io', 'archive.ph', 'googlebot-ua'];
+const DEFAULT_STRATEGY_ORDER = ['direct', 'google-referer', '12ft.io', 'archive.ph', 'googlebot-ua'];
 
 // order: optional array of strategy names controlling priority — lets the
 // user customize fetch order globally (Settings) or per-feed (feed rules),
@@ -157,7 +224,10 @@ async function fetchArticleHtml(url, cookieJars, order) {
     try {
       const html = await strategy.run(url, cookieJars);
       if (html && html.length > strategy.minLength) return { html, source: name };
-    } catch (e) { console.warn(`[fetch/${name}]`, e.message); }
+    } catch (e) {
+      if (e instanceof NonHtmlContentError) throw e; // no fetch strategy will turn an image into HTML — stop immediately
+      console.warn(`[fetch/${name}]`, e.name === 'AbortError' ? 'timed out' : e.message);
+    }
   }
 
   throw new Error('All fetch strategies exhausted for: ' + url);
@@ -207,23 +277,65 @@ function extractLeadImage($) {
   );
 }
 
+// Walks up from a just-removed element's former parent, removing ancestors
+// that are now empty as a direct result of that removal — bounded to the
+// removed element's own ancestry, not a sweep of the whole document. A
+// blanket sweep would also catch elements that were already empty for
+// unrelated reasons (many real pages have empty <span>/<div> elements used
+// purely as CSS/JS hooks), which risks stripping page structure a rule had
+// nothing to do with — especially in the early applyBlockRules pass, which
+// runs on the raw page before Readability has even parsed it.
+function pruneNowEmptyAncestors($, parentEl) {
+  let $p = $(parentEl);
+  while ($p.length && $p.children().length === 0 && !$p.text().trim() &&
+         $p.find('img,video,iframe,svg,picture,audio').length === 0) {
+    const $next = $p.parent();
+    $p.remove();
+    $p = $next;
+  }
+}
+
 function applyBlockRules(html, feedRules) {
   if (!feedRules || (!feedRules.cssSelectors?.length && !feedRules.htmlPatterns?.length)) return html;
   const $ = _cheerio.load(html);
 
   if (feedRules.cssSelectors?.length) {
-    try { $(feedRules.cssSelectors.join(', ')).remove(); } catch {}
+    // Applied one at a time rather than $(selectors.join(', ')) as a
+    // single call. cheerio's selector engine (css-select) supports less
+    // CSS than a real browser does — no pseudo-elements, for instance —
+    // and the selectors here were built by walking a real browser's DOM
+    // (see buildSelector in App.jsx), so they're only ever guaranteed
+    // valid *there*, not necessarily here. With one combined selector
+    // string, a single selector css-select can't parse throws and (since
+    // this was wrapped in one try/catch) silently kills removal for every
+    // *other* selector too — including a brand-new one just picked,
+    // making the element picker look completely broken for anything you
+    // pick from then on, even though the actual problem is one unrelated
+    // selector saved earlier. Isolating each one means a bad selector only
+    // ever affects itself.
+    for (const sel of feedRules.cssSelectors) {
+      try {
+        const $matched = $(sel);
+        const parents = $matched.map((_, el) => $(el).parent()[0]).get();
+        $matched.remove();
+        for (const p of parents) pruneNowEmptyAncestors($, p);
+      } catch (e) { console.warn('[block-rule] selector failed, skipping just this one:', sel, e.message); }
+    }
   }
   if (feedRules.htmlPatterns?.length) {
     for (const pattern of feedRules.htmlPatterns) {
       try {
         const re = new RegExp(pattern, 'i');
-        $('*').filter((_, el) => {
+        const $matched = $('*').filter((_, el) => {
           return re.test($(el).text()) && $(el).children().length === 0;
-        }).closest('[class],[id]').remove();
+        }).closest('[class],[id]');
+        const parents = $matched.map((_, el) => $(el).parent()[0]).get();
+        $matched.remove();
+        for (const p of parents) pruneNowEmptyAncestors($, p);
       } catch {}
     }
   }
+
   return $.html();
 }
 
@@ -245,10 +357,52 @@ function extractReadable(html, url) {
 async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
   await loadDeps();
 
+  // Some feeds' <link> doesn't point at "the article" at all — see the
+  // matching comment on rssContent in fetchFeed above for the Daring
+  // Fireball Linked List example (link points at whatever external page is
+  // being linked to; the feed's own content holds the actual commentary).
+  // When the feed itself already supplies substantial content, use it
+  // directly rather than live-fetching and Readability-extracting whatever
+  // <link> happens to point at — for feeds like this, that's both more
+  // correct (shows the feed owner's own writing, not an unrelated external
+  // page) and faster (skips the fetch+extraction pipeline entirely).
+  // "Substantial" uses the same >400-stripped-character threshold applied
+  // when this was captured at feed-fetch time, so a feed that only ever
+  // supplies a short teaser in its RSS still falls through to the normal
+  // live-fetch behavior below, unchanged.
+  if (rssFallback?.content && stripHtml(rssFallback.content).trim().length > 400) {
+    const text = rssFallback.content;
+    return {
+      title:       rssFallback.title  || '',
+      byline:      rssFallback.byline || '',
+      content:     sanitizeArticleHtml(text),
+      excerpt:     stripHtml(text).trim().slice(0, 300),
+      siteName:    '',
+      bypassSource:'rss-content',
+      length:      stripHtml(text).trim().length,
+    };
+  }
+
   let html, source;
   try {
     ({ html, source } = await fetchArticleHtml(url, cookieJars, feedRules?.fetchStrategyOrder));
   } catch (fetchErr) {
+    // A bare image link (see NonHtmlContentError above) — unlike a genuine
+    // fetch failure or a PDF, this is trivial to actually render well:
+    // just show the image directly instead of attempting text extraction
+    // on it, which previously either errored out or produced blank/garbled
+    // output since Readability has no real HTML structure to work with.
+    if (fetchErr instanceof NonHtmlContentError) {
+      return {
+        title:       rssFallback?.title || '',
+        byline:      '',
+        content:     sanitizeArticleHtml(`<img src="${url}" alt="" style="max-width:100%;height:auto;display:block;margin:0 auto;" />`),
+        excerpt:     '',
+        siteName:    '',
+        bypassSource:'direct-image',
+        length:      0,
+      };
+    }
     // All fetch strategies failed — fall back to the RSS summary/description
     // if the caller supplied one (common for paywalled sites like Bloomberg
     // that include their article text in the RSS item itself). Show a notice
@@ -303,6 +457,21 @@ async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
       content = `<figure class="flux-lead-image"><img src="${safeImg}" alt="" loading="lazy" /></figure>` + content;
     }
   }
+
+  // Second block-rules pass, on the fully-assembled final content rather
+  // than the raw pre-Readability page HTML applyBlockRules ran on above.
+  // Necessary because some elements the rules target don't exist yet at
+  // that earlier point — the lead image figure just above is synthesized
+  // by Flux itself *after* Readability runs, so a rule picked against it
+  // (e.g. via the element picker, which shows the rendered reader output)
+  // would have nothing to match against in the earlier pass: it'd get
+  // silently skipped there, then unconditionally re-added by the lead-
+  // image step regardless, making the rule look like it "did nothing" on
+  // every re-fetch. The earlier pass stays as-is — stripping junk from the
+  // raw page before Readability parses it measurably helps Readability's
+  // own content-detection heuristics — this just adds a final safety net
+  // that also covers anything assembled after that point.
+  content = applyBlockRules(content, feedRules);
 
   return {
     title:       readable?.title   || '',
@@ -386,6 +555,35 @@ async function fetchYoutubeChannelAvatar(feedUrl, cookieJars) {
   } catch { return null; }
 }
 
+// ISO 8601 duration (e.g. "PT4M13S", "PT1H2M3S", "PT45S") → "4:13" /
+// "1:02:03" / "0:45" display format.
+function formatIso8601Duration(iso) {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
+  if (!m) return null;
+  const h = parseInt(m[1] || '0', 10), min = parseInt(m[2] || '0', 10), s = parseInt(m[3] || '0', 10);
+  if (!h && !min && !s) return null;
+  return h > 0 ? `${h}:${String(min).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${min}:${String(s).padStart(2,'0')}`;
+}
+
+// YouTube's RSS feed items don't expose video duration in any form (see
+// toShortsFreeYoutubeUrl's comment above) — the only way to get it is a
+// secondary fetch of the video's own watch page, which exposes it via the
+// standard schema.org VideoObject microdata (`<meta itemprop="duration"
+// content="PT4M13S">`). Unlike the channel avatar (one extra request per
+// *feed*), this is one extra request per *video* — a channel with 30
+// videos in its feed would mean 30 extra fetches, which is both slow and
+// a good way to get rate-limited. Callers are expected to bound how many
+// of these run per refresh (see fetchFeedCached in server/index.js) rather
+// than fetching duration for every video in a feed unconditionally.
+async function fetchYoutubeVideoDuration(videoUrl, cookieJars) {
+  try {
+    const resp = await fetchWithCookies(videoUrl, { timeoutMs: 5000 }, cookieJars);
+    const html = await resp.text();
+    const match = html.match(/<meta\s+itemprop=["']duration["']\s+content=["']([^"']+)["']/i);
+    return match ? formatIso8601Duration(match[1]) : null;
+  } catch { return null; }
+}
+
 // ─── RSS feed fetch ───────────────────────────────────────────────────────────
 async function fetchFeed(feedConfig, cookieJars) {
   await loadDeps();
@@ -452,6 +650,7 @@ async function fetchFeed(feedConfig, cookieJars) {
     const thumbnail =
       item.mediaThumbnail?.['$']?.url ||
       item.mediaGroup?.['media:thumbnail']?.[0]?.['$']?.url ||
+      (item.enclosure?.type?.startsWith('image/') ? item.enclosure.url : null) ||
       (videoId ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg` : null);
 
     // Heuristic Shorts detection (fallback for feeds where the playlist_id
@@ -466,8 +665,8 @@ async function fetchFeed(feedConfig, cookieJars) {
     const hasShortsTag  = /#shorts\b/i.test(`${item.title || ''} ${mediaDescription}`);
     const hasShortsPath = /\/shorts\//i.test(item.link || '');
     const isShort = isYoutube && (hasShortsTag || hasShortsPath);
-    // Stable ID: prioritize guid (Atom's <id> / RSS's <guid>) over link for
-    // identity hashing. This matters more than it looks: <link> is NOT
+    // Stable ID: prioritize guid/id (Atom's <id> / RSS's <guid>) over link
+    // for identity hashing. This matters more than it looks: <link> is NOT
     // guaranteed stable by either spec, and several real feeds exploit
     // that — Daring Fireball's "Linked List" items, for instance, point
     // <link> at whatever external article is being linked to (not at
@@ -478,19 +677,61 @@ async function fetchFeed(feedConfig, cookieJars) {
     // appeared," because that's literally what happens downstream. guid
     // (Atom <id> / RSS <guid>) exists specifically to be a permanent,
     // content-independent identifier per spec, so it should win whenever
-    // present. Only fall back to link, then position, when there's no
-    // guid at all.
-    const rawKey = item.guid || item.link || `${feedConfig.id}-pos-${i}`;
+    // present.
+    //
+    // IMPORTANT: rss-parser exposes RSS 2.0's <guid> as item.guid, but
+    // Atom's <id> comes through as item.id instead — a different field
+    // entirely. The check below previously only looked at item.guid, which
+    // is always undefined for Atom feeds (DF included), so it silently
+    // fell through to item.link every single time — exactly the failure
+    // mode this comment describes wanting to prevent. Both are checked now.
+    //
+    // Below THAT, before finally falling back to raw array position: a
+    // feed with no guid/id/link at all (rare, but real — some minimal or
+    // broken feeds genuinely omit all three) previously fell straight to
+    // `${feedId}-pos-${i}`, keyed purely on the item's index in this
+    // fetch's array. That's fragile in a specific, easy-to-hit way: if the
+    // feed's item order shifts at all between fetches — a new item gets
+    // inserted at the top, one gets removed, the publisher re-sorts —
+    // every subsequent item's index shifts too, so position i now refers
+    // to a genuinely different article than it did last time. The article
+    // that used to own that ID keeps it, misattributing its read/starred
+    // state to whatever article now happens to sit in that slot, while the
+    // real previously-read article looks unread again under a new one.
+    // Title+pubDate is a much better last resort: both fields belong to
+    // the article itself, not its position, so they stay attached to the
+    // right item regardless of how the feed reorders things around it —
+    // this only degrades to pure position when a feed is missing all four
+    // of guid, id, link, AND title+pubDate, which is vanishingly rare.
+    const contentKey = (item.title && (item.pubDate || item.isoDate)) ? `content:${item.title}|${item.pubDate || item.isoDate}` : null;
+    const rawKey = item.guid || item.id || item.link || contentKey || `${feedConfig.id}-pos-${i}`;
     let hash = 0;
     for (let c = 0; c < rawKey.length; c++) { hash = ((hash << 5) - hash + rawKey.charCodeAt(c)) | 0; }
     const stableKey = (Math.abs(hash) >>> 0).toString(36) + '_' + rawKey.replace(/[^a-zA-Z0-9._~-]/g,'_').slice(-40);
+
+    // Some feeds' <link> doesn't point at "the article" at all — Daring
+    // Fireball's Linked List format is the clearest example: <link> points
+    // at whatever external page is being linked to, while the feed's own
+    // <content> holds Gruber's actual commentary about it. Previously only
+    // a 300-char plain-text `summary` was kept from RSS content (sized for
+    // the article-list preview), and opening an article always live-fetched
+    // and Readability-extracted whatever <link> pointed at — for a Linked
+    // List item, that's the external site, not the feed owner's own
+    // commentary, so the commentary (the actual "text around the link")
+    // never appeared anywhere. rssContent preserves the full thing when
+    // it's substantial, so fetchArticle can prefer it — see the matching
+    // comment there for the size heuristic.
+    const rawContent = item['content:encoded'] || item.content || '';
+    const strippedLen = stripHtml(rawContent).trim().length;
+    const rssContent = strippedLen > 400 ? rawContent : null;
 
     return {
       id:         `${feedConfig.id}__${stableKey}`,
       feedId:     feedConfig.id,
       title:      decodeHtmlEntities(item.title || 'Untitled'),
-      link:       item.link  || item.guid || '',
+      link:       item.link  || item.guid || item.id || '',
       summary:    decodeHtmlEntities(stripHtml(item.contentSnippet || item.summary || '').slice(0, 300)),
+      rssContent,
       date:       resolveItemDate(item, feed.title || feedConfig.name),
       isRead:     false,
       isStarred:  false,
@@ -510,12 +751,21 @@ async function fetchFeed(feedConfig, cookieJars) {
   // optionally do the avatar upgrade in the background. The 300-800ms
   // channel-page fetch per YouTube feed was a major contributor to slow
   // refresh times when a user has multiple YouTube channels subscribed.
-  let favicon = null;
-  try {
-    const homeUrl = feed.link || feedConfig.url;
-    const origin  = new URL(homeUrl).origin;
-    favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(origin)}&sz=32`;
-  } catch {}
+  //
+  // Only computed when feedConfig doesn't already have a favicon — this
+  // previously ran unconditionally on every single fetch, which meant a
+  // real, already-fetched-and-persisted YouTube channel avatar (see
+  // fetchFeedAvatar below) got silently clobbered back to the generic
+  // fallback on the very next refresh, every time — the avatar upgrade
+  // could never actually stick.
+  let favicon = feedConfig.favicon || null;
+  if (!favicon) {
+    try {
+      const homeUrl = feed.link || feedConfig.url;
+      const origin  = new URL(homeUrl).origin;
+      favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(origin)}&sz=32`;
+    } catch {}
+  }
 
   return { feedId: feedConfig.id, title: feed.title || feedConfig.name, items, favicon };
 }
@@ -919,8 +1169,8 @@ async function resolveYoutubeFeedUrl(parsedUrl, cookieJars) {
 
 module.exports = {
   loadDeps, fetchWithCookies, fetchArticleHtml, fetchArticle,
-  applyBlockRules, extractReadable, fetchFeed, fetchFeedAvatar,
+  applyBlockRules, extractReadable, fetchFeed, fetchFeedAvatar, fetchYoutubeVideoDuration,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest,
-  getCookieJar, resolveFeedUrl, sanitizeArticleHtml,
+  getCookieJar, resolveFeedUrl, sanitizeArticleHtml, MOBILE_UA,
   FETCH_STRATEGY_NAMES: DEFAULT_STRATEGY_ORDER,
 };

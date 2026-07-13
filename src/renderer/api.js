@@ -46,6 +46,10 @@ async function http(method, path, body, isFormData = false) {
   const resp = await fetch(httpBase() + path, {
     method,
     headers,
+    // Every API response is live per-user state — never let the browser's
+    // own HTTP cache serve a stale one, on top of the server's
+    // Cache-Control: no-store response header (see server/index.js).
+    cache: 'no-store',
     body: isFormData ? body : (body ? JSON.stringify(body) : undefined),
   });
   if (resp.status === 401) {
@@ -149,6 +153,17 @@ export const articles = {
   fetch:      pick((a)   => window.flux.articles.fetch(a),      (a)   => http('POST', '/api/article/fetch', a)),
   clearCache: pick((url) => window.flux.articles.clearCache(url), (url) => http('POST', '/api/article/clear-cache', { url })),
   markRead:   pick((a)   => window.flux.articles.markRead(a),   (a)   => http('POST', '/api/articles/mark-read', a)),
+  // items: [{articleId, feedId}, ...]. Falls back to sequential per-item
+  // IPC calls on Electron if the preload bridge doesn't expose a bulk
+  // method yet — keeps this forward-compatible without requiring every
+  // Electron build to have the newer preload in lockstep.
+  markReadBulk: pick(
+    async (items) => {
+      if (window.flux.articles.markReadBulk) return window.flux.articles.markReadBulk(items);
+      for (const item of items) await window.flux.articles.markRead(item);
+    },
+    (items) => http('POST', '/api/articles/mark-read-bulk', { items }),
+  ),
   toggleStar: pick((a)   => window.flux.articles.toggleStar(a), (a)   => http('POST', '/api/articles/toggle-star', a)),
   getState:   pick(()    => window.flux.articles.getState(),    ()    => http('GET',  '/api/articles/state')),
 };

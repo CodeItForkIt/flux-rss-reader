@@ -318,14 +318,10 @@ function Sidebar({ folders, feeds, articles, activeView, onSelectView, onOpenAdd
     return articles.filter(a => {
       const feed = feeds.find(f => f.id === a.feedId);
       if (feed?.hideShorts && a.isShort) return false;
-      if (feed?.titleBlocklist?.length) {
-        for (const pattern of feed.titleBlocklist) {
-          try { if (new RegExp(pattern,'i').test(a.title)) return false; } catch {}
-        }
-      }
+      if (titleIsBlocked(a.title, feed, settings)) return false;
       return true;
     });
-  }, [articles, feeds]);
+  }, [articles, feeds, settings]);
   const unreadInFolder = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&(fid==='__all'||feeds.find(f=>f.id===a.feedId)?.folder===fid)).length;
   const unreadInFeed   = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&a.feedId===fid).length;
 
@@ -508,7 +504,7 @@ function FolderGroup({ folder, feeds, unreadTotal, unreadPerFeed, activeView, on
 }
 
 // ─── Article List ─────────────────────────────────────────────────────────────
-function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedId, onMarkAllRead, filters, onFiltersChange, showAiFilter, onOpenFeedSettings, collapsed, onToggleCollapse, deArrowEnabled }) {
+function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedId, onMarkAllRead, filters, onFiltersChange, showAiFilter, onOpenFeedSettings, collapsed, onToggleCollapse, deArrowEnabled, settings }) {
   const [search, setSearch] = useState('');
   const listScrollRef = useRef(null);
 
@@ -626,37 +622,84 @@ function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedI
       )}
       {displayed.map(item => item.type==='group'
         ? <GroupRow key={`group:${item.clusterId}`} group={item} feeds={feeds} isSelected={selectedId===`group:${item.clusterId}`} onClick={()=>handleSelect({ id:`group:${item.clusterId}`, isGroup:true, clusterId:item.clusterId, members:item.members })} />
-        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} />
+        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} settings={settings} />
       )}
     </div>
   </div>;
 }
 
-function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled }) {
+// Checks a title against both the global blocklist (settings.titleBlocklist
+// — applies across every feed) and a specific feed's own blocklist.
+// Previously only the per-feed one existed anywhere in the filtering code,
+// in three separate near-identical inline try/catch loops; centralizing it
+// here means the global list only has to be threaded into one place per
+// call site instead of duplicating the same regex loop a fourth time.
+function titleIsBlocked(title, feed, settings) {
+  const patterns = [...(settings?.titleBlocklist || []), ...(feed?.titleBlocklist || [])];
+  for (const pattern of patterns) {
+    try { if (new RegExp(pattern, 'i').test(title)) return true; } catch {}
+  }
+  return false;
+}
+
+function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settings }) {
   const [h,setH]=useState(false);
   const isYt=article.isYoutube;
   const dearrow = useDeArrow(isYt ? article.videoId : null, !!deArrowEnabled);
   const displayTitle = (deArrowEnabled && dearrow?.title) ? dearrow.title : article.title;
   const displayThumb = (deArrowEnabled && dearrow?.thumb) ? dearrow.thumb : article.thumbnail;
+  // Per-feed thumbnailMode overrides the global setting; null/undefined
+  // inherits it. Previously this was YouTube-only even though thumbnail
+  // extraction itself (see fetchFeed in core/fetcher.js) already pulls
+  // media:thumbnail/enclosure images for any feed that provides one, not
+  // just YouTube — most blogs don't include one, but plenty of podcast/
+  // photo-blog feeds do, and they never got a chance to show it. 'large'
+  // is the default, matching the only style that existed before this was
+  // configurable.
+  const mode = feed?.thumbnailMode || settings?.listThumbnailMode || 'large';
+  const showThumb = mode !== 'none' && !!displayThumb;
+
+  const metaRow = <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
+    <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
+    {isYt&&article.duration&&<Badge tone="yt" tiny>▶ {article.duration}</Badge>}
+    {article.clusterId&&<Badge tone="ai" tiny>◆ {article.clusterSize}</Badge>}
+    {feed?.inlineBrowser&&<Badge tone="muted" tiny>inline</Badge>}
+    {deArrowEnabled&&dearrow?.title&&<Badge tone="muted" tiny>DeArrow</Badge>}
+    <span style={{ flex:1 }} />
+    {!article.isRead&&<div style={{ width:6, height:6, borderRadius:'50%', background:isYt?T.youtube:T.accent, flexShrink:0 }} />}
+    <span style={{ fontSize:10, color:T.textSubtle }}>{timeAgo(article.date)}</span>
+  </div>;
+  const titleEl = <div style={{ fontSize:13, fontWeight:article.isRead?400:600, color:article.isRead?T.textMuted:T.text, lineHeight:1.4, marginBottom:4, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{displayTitle}</div>;
+  const summaryEl = article.summary&&<div style={{ fontSize:12, color:T.textMuted, lineHeight:1.45, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{article.summary}</div>;
+
+  // 'large': image above the title, full width. Height is explicitly
+  // capped (not just aspect-ratio-derived) — previously this was
+  // width:100% + aspectRatio:16/9 with no ceiling at all, so in a wide
+  // article-list column (a maximized window, a collapsed sidebar, a
+  // tablet) the image could scale up to a genuinely oversized block that
+  // dwarfed the actual text content it was supposed to be a preview for.
+  const largeThumb = showThumb && <div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
+    {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
+  </div>;
+
+  // 'small': a fixed square thumbnail beside the title/meta/summary block,
+  // the compact layout style most readers (Reeder, NetNewsWire, etc.) use.
+  const smallThumb = showThumb && <div style={{ width:52, height:52, borderRadius:6, overflow:'hidden', background:T.bg, flexShrink:0, position:'relative' }}>
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:18, height:18, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:8 }}>▶</div></div>}
+  </div>;
 
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {isYt&&displayThumb&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-      <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
-      <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>
-      {deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
-    </div>}
-    <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
-      <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
-      {isYt&&article.duration&&<Badge tone="yt" tiny>▶ {article.duration}</Badge>}
-      {article.clusterId&&<Badge tone="ai" tiny>◆ {article.clusterSize}</Badge>}
-      {feed?.inlineBrowser&&<Badge tone="muted" tiny>inline</Badge>}
-      {deArrowEnabled&&dearrow?.title&&<Badge tone="muted" tiny>DeArrow</Badge>}
-      <span style={{ flex:1 }} />
-      {!article.isRead&&<div style={{ width:6, height:6, borderRadius:'50%', background:isYt?T.youtube:T.accent, flexShrink:0 }} />}
-      <span style={{ fontSize:10, color:T.textSubtle }}>{timeAgo(article.date)}</span>
-    </div>
-    <div style={{ fontSize:13, fontWeight:article.isRead?400:600, color:article.isRead?T.textMuted:T.text, lineHeight:1.4, marginBottom:4, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{displayTitle}</div>
-    {article.summary&&<div style={{ fontSize:12, color:T.textMuted, lineHeight:1.45, display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical', overflow:'hidden' }}>{article.summary}</div>}
+    {mode==='small' ? (
+      <div style={{ display:'flex', gap:10 }}>
+        {smallThumb}
+        <div style={{ flex:1, minWidth:0 }}>{metaRow}{titleEl}{summaryEl}</div>
+      </div>
+    ) : (
+      <>{largeThumb}{metaRow}{titleEl}{summaryEl}</>
+    )}
     {article.isStarred&&<span style={{ position:'absolute', bottom:10, right:12, fontSize:11, color:T.warning }}>★</span>}
   </div>;
 }
@@ -668,7 +711,7 @@ function GroupRow({ group, feeds, isSelected, onClick }) {
   const sourceNames = [...new Set(group.members.map(m=>feeds.find(f=>f.id===m.feedId)?.name || domainOf(m.link)))];
   const anyUnread = group.members.some(m=>!m.isRead);
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {isYt&&top.thumbnail&&<div style={{ width:'100%', aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+    {isYt&&top.thumbnail&&<div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
       <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
     </div>}
     <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
@@ -745,83 +788,68 @@ function GroupView({ group, feeds, settings, onOpenMember }) {
     </div>
   );
 }
-function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }) {
-  const [history, setHistory] = useState([url]);
-  const [idx, setIdx]         = useState(0);
-  const [title, setTitle]     = useState(null);
+function InlineBrowser({ url, onClose, onNavigateArticle, isMobile, trustedDomains, onToggleTrust }) {
   const [loading, setLoading] = useState(true);
-  const [canGoBack, setCanGoBack]       = useState(false);
-  const [canGoForward, setCanGoForward] = useState(false);
   const webviewRef = useRef(null);
   const iframeRef  = useRef(null);
-  const current    = history[idx];
+
+  const hostname = useMemo(() => { try { return new URL(url).hostname; } catch { return null; } }, [url]);
+  const isTrusted = !!(hostname && (trustedDomains || []).includes(hostname));
 
   // Web mode: proxy through the backend so X-Frame-Options/CSP headers that
   // would otherwise block framing are stripped server-side.
   const proxiedSrc = useMemo(() => {
-    const params = new URLSearchParams({ url: current });
+    const params = new URLSearchParams({ url });
     const token = api.getAuthToken();
     if (token) params.set('token', token);
+    // Ask the linked page for its mobile layout (most sites that do UA
+    // sniffing serve one) when Flux's own layout is currently mobile —
+    // a desktop-styled page crammed into a phone-width iframe is often
+    // unreadable, whereas the mobile layout is usually built for exactly
+    // that width.
+    if (isMobile) params.set('mobile', '1');
     return `/api/proxy?${params.toString()}`;
-  }, [current]);
-
-  const pushHistory = useCallback((newUrl) => {
-    if (!newUrl || newUrl === 'about:blank') return;
-    setHistory(h => {
-      if (h[idx] === newUrl) return h; // no-op, already here
-      return [...h.slice(0, idx+1), newUrl];
-    });
-    setIdx(i => i+1);
-  }, [idx]);
+  }, [url, isMobile]);
 
   // ── Electron: <webview> wiring ────────────────────────────────────────────
+  // No address bar, no history stack — this shows exactly one page (the
+  // article's own URL). Any navigation away from it, from anywhere on the
+  // page, hands off to the system browser instead of following it here.
+  //
+  // Note: this is a renderer-side approximation. True prevention (never
+  // letting the guest page's navigation start at all) needs a main-process
+  // `will-navigate` handler on the webview's webContents, which isn't
+  // wired up here — this instead lets the navigation happen, immediately
+  // cancels/snaps back to the original URL, and opens the destination
+  // externally. There's a brief flash of the followed page rather than it
+  // never rendering at all, but it never stays inline.
   useEffect(() => {
     if (!api.isElectron) return;
     const wv = webviewRef.current;
     if (!wv) return;
 
     const onStartLoading = () => setLoading(true);
-    const onStopLoading  = () => {
-      setLoading(false);
-      try {
-        setCanGoBack(wv.canGoBack());
-        setCanGoForward(wv.canGoForward());
-      } catch {}
+    const onStopLoading  = () => setLoading(false);
+    const redirectAway = (newUrl) => {
+      if (!newUrl || newUrl === url) return;
+      try { wv.stop(); } catch {}
+      api.openExternal(newUrl);
+      try { wv.loadURL(url); } catch {}
     };
-    const onNavigate = (e) => {
-      const newUrl = e.url;
-      if (newUrl && newUrl !== current) pushHistory(newUrl);
-      // Update back/forward availability immediately on navigation, not
-      // just on stop-loading — makes buttons update in real-time.
-      try { setCanGoBack(wv.canGoBack()); setCanGoForward(wv.canGoForward()); } catch {}
-    };
-    const onTitleUpdated = (e) => setTitle(e.title);
-    const onFailLoad = (e) => {
-      // -3 is ERR_ABORTED, common on redirects — ignore
-      if (e.errorCode === -3) return;
-      setLoading(false);
-    };
+    const onNavigate = (e) => redirectAway(e.url);
 
     wv.addEventListener('did-start-loading', onStartLoading);
     wv.addEventListener('did-stop-loading', onStopLoading);
     wv.addEventListener('did-navigate', onNavigate);
     wv.addEventListener('did-navigate-in-page', onNavigate);
-    wv.addEventListener('page-title-updated', onTitleUpdated);
-    wv.addEventListener('did-fail-load', onFailLoad);
 
     // Keyboard shortcuts inside the embedded page don't bubble to our
     // window — <webview> content runs in a separate guest page. Forward
-    // a small set of navigation shortcuts via before-input-event so you're
-    // never "trapped" with no way to move between articles.
-    //   Alt+← / Alt+→  → previous/next article (Alt avoids clobbering
-    //                     normal arrow-key use in the embedded page, e.g.
-    //                     text fields, video seeking, carousels)
-    //   Escape          → step back through followed-link history
+    // Alt+←/→ for article navigation so you're never "trapped" in here.
     const onBeforeInput = (e) => {
       if (e.type !== 'keyDown') return;
       if (e.alt && e.key === 'ArrowLeft')  onNavigateArticle?.(-1);
       else if (e.alt && e.key === 'ArrowRight') onNavigateArticle?.(1);
-      else if (e.key === 'Escape') onStepBack?.();
     };
     wv.addEventListener('before-input-event', onBeforeInput);
 
@@ -830,135 +858,114 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
       wv.removeEventListener('did-stop-loading', onStopLoading);
       wv.removeEventListener('did-navigate', onNavigate);
       wv.removeEventListener('did-navigate-in-page', onNavigate);
-      wv.removeEventListener('page-title-updated', onTitleUpdated);
-      wv.removeEventListener('did-fail-load', onFailLoad);
       wv.removeEventListener('before-input-event', onBeforeInput);
     };
-  }, [pushHistory, onNavigateArticle, onStepBack]); // intentionally omits 'current' — listener setup runs once per mount
+  }, [url, onNavigateArticle]);
 
-  // Electron: target=_blank / window.open() inside the page → navigate
-  // the webview itself instead of spawning a new Electron window.
+  // Electron: target=_blank / window.open() inside the page → open
+  // externally instead of spawning a new Electron window.
   useEffect(() => {
     if (!api.isElectron) return;
-    return api.webview.onNewWindow((newUrl) => {
-      pushHistory(newUrl);
-      webviewRef.current?.loadURL(newUrl);
-    });
-  }, [pushHistory]);
+    return api.webview.onNewWindow((newUrl) => { if (newUrl) api.openExternal(newUrl); });
+  }, []);
 
-  // Load the current URL into the webview whenever it changes via our own
-  // back/forward buttons (in-page navigation already updates history directly).
+  // Web mode: the injected proxy shim (see buildProxyShim in
+  // server/index.js) intercepts link clicks inside the framed page and
+  // posts a message up here instead of navigating the iframe.
   useEffect(() => {
-    if (!api.isElectron) return;
-    const wv = webviewRef.current;
-    if (!wv) return;
-    try { if (wv.getURL?.() === current) return; } catch {}
-    try { wv.loadURL?.(current); } catch {}
-  }, [current]);
-
-  const navigate = (dir) => {
-    if (api.isElectron) {
-      const wv = webviewRef.current;
-      try {
-        if (dir < 0 && wv?.canGoBack?.()) wv.goBack();
-        else if (dir > 0 && wv?.canGoForward?.()) wv.goForward();
-      } catch {}
-      return;
-    }
-    setIdx(i => Math.max(0, Math.min(history.length-1, i+dir)));
-  };
+    if (api.isElectron) return;
+    const onMessage = (e) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.type === 'flux-proxy-link-click' && e.data.url) api.openExternal(e.data.url);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   const reload = () => {
     if (api.isElectron) { try { webviewRef.current?.reload?.(); } catch {} }
     else if (iframeRef.current) iframeRef.current.src = iframeRef.current.src;
   };
 
-  const handleCopyCurrentUrl = useCallback(async () => {
-    if (!current || current === 'about:blank') return;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(current);
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = current; ta.style.position = 'fixed'; ta.style.opacity = '0';
-        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-      }
-    } catch {}
-  }, [current]);
-
-  // Web-mode iframe: detect in-page navigation where possible (same-origin
-  // only — cross-origin loads can't be introspected, so back/forward there
-  // just replays our own history stack).
-  const handleIframeLoad = () => {
-    setLoading(false);
-    try {
-      const loc = iframeRef.current?.contentWindow?.location?.href;
-      if (!loc || loc === 'about:blank') return;
-
-      const proxiedHref = new URL(proxiedSrc, window.location.href).href;
-      const parsedLoc = new URL(loc);
-      if (parsedLoc.origin === window.location.origin && parsedLoc.pathname === '/api/proxy') return;
-      if (loc !== proxiedHref && !loc.startsWith(proxiedHref)) pushHistory(loc);
-    } catch {} // cross-origin — expected, ignore
-  };
-
-  const backDisabled    = api.isElectron ? !canGoBack    : idx === 0;
-  const forwardDisabled = api.isElectron ? !canGoForward : idx === history.length-1;
-
   return (
     <div style={{ position:'absolute', inset:0, zIndex:30, background:T.bg, display:'flex', flexDirection:'column' }}>
-      {/* Browser chrome */}
+      {/* Minimal chrome — no address bar or navigation history. This view
+          only ever shows the one article URL; every link on it exits to
+          the system browser rather than navigating here. */}
       <div style={{ padding: isMobile?'10px 12px':'8px 12px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, background:T.surface, flexShrink:0, paddingTop: isMobile?'calc(10px + env(safe-area-inset-top))':8 }}>
-        <IconBtn icon="←" title="Back" onClick={()=>navigate(-1)} disabled={backDisabled} size={isMobile?36:28} />
-        <IconBtn icon="→" title="Forward" onClick={()=>navigate(1)} disabled={forwardDisabled} size={isMobile?36:28} />
         <IconBtn icon="↺" title="Reload" onClick={reload} size={isMobile?36:28} />
         {loading && <Spinner size={13} />}
         <div style={{ flex:1 }} />
-        {!isMobile && <><Divider vertical margin={4} /><IconBtn icon="⧉" title="Copy current URL" onClick={handleCopyCurrentUrl} size={isMobile?36:28} /></>}
-        <Divider vertical margin={4} />
-        <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(current)} size={isMobile?36:28} />
+        {/* Per-domain trust toggle — web mode only. Electron's <webview> is
+            already a fully separate Chromium process, not subject to the
+            iframe-sandbox trade-off this concerns. Trusting a domain lets
+            that specific site's JS use real per-origin storage/cookies
+            (needed for things like theme prefs) — see the sandbox comment
+            below for exactly what that grants and why it's opt-in per site
+            rather than on by default. */}
+        {!api.isElectron && hostname && (
+          <IconBtn
+            icon={isTrusted ? '🔓' : '🔒'}
+            title={isTrusted
+              ? `${hostname} is trusted — its scripts get real storage/cookie access. Click to revoke.`
+              : `Trust ${hostname}? Its scripts will be able to reach this app's window and make requests as your account. Only do this for sites you trust.`}
+            active={isTrusted}
+            onClick={()=>onToggleTrust?.(hostname, !isTrusted)}
+            size={isMobile?36:28}
+          />
+        )}
+        <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(url)} size={isMobile?36:28} />
         {!isMobile && <><Divider vertical margin={4} /><Btn small variant="outline" onClick={onClose}>✕ Close</Btn></>}
         {isMobile && <IconBtn icon="✕" title="Close" onClick={onClose} size={36} />}
       </div>
 
       {api.isElectron ? (
         <>
-          <webview
-            ref={webviewRef}
-            src={current}
-            style={{ flex:1, display:'flex' }}
-            allowpopups="true"
-          />
+          <webview ref={webviewRef} src={url} style={{ flex:1, display:'flex' }} allowpopups="true" />
           {!isMobile && (
             <div style={{ padding:'4px 12px', fontSize:11, color:T.textSubtle, background:T.surface, borderTop:`1px solid ${T.borderSubtle}`, flexShrink:0 }}>
-              Alt+← / Alt+→ switches articles · Escape steps back through followed links
+              Links open in your default browser · Alt+← / Alt+→ switches articles
             </div>
           )}
           {isMobile && <div style={{ flexShrink:0, height:'calc(52px + env(safe-area-inset-bottom))' }} />}
         </>
       ) : (
         <>
-          {current ? (
+          {url ? (
             <iframe
-              key={current}
+              // Remounts (fresh navigation) whenever trust status for this
+              // domain changes — sandbox attribute changes don't apply
+              // retroactively to an already-loaded document.
+              key={`${url}:${isTrusted}`}
               ref={iframeRef}
               src={proxiedSrc}
-              onLoad={handleIframeLoad}
-              // NOTE: deliberately does NOT include allow-same-origin. This
-              // iframe's document is served from OUR OWN origin (/api/proxy),
-              // just displaying a rewritten copy of someone else's page —
-              // allow-same-origin + allow-scripts together would let that
-              // page's JS treat itself as genuinely same-origin with the
-              // real Flux app: reaching into window.parent's DOM, and
-              // making credentialed fetch()/XHR calls to /api/* that read
-              // real responses (feeds, settings, everything) instead of
-              // being blocked as cross-origin. The opaque sandboxed origin
-              // this omission produces is what actually protects the app;
-              // some sites may behave slightly worse (e.g. code that
-              // assumes persistent per-origin storage) as a result — that's
-              // an acceptable trade for not exposing the whole account to
-              // any page a feed happens to link to.
-              sandbox="allow-scripts allow-forms allow-popups allow-pointer-lock allow-top-navigation-by-user-activation"
+              onLoad={()=>setLoading(false)}
+              // Deliberately omits allow-same-origin UNLESS the user has
+              // explicitly trusted this exact hostname via the toggle
+              // above. This iframe's document is served from OUR OWN
+              // origin (/api/proxy), just displaying a rewritten copy of
+              // someone else's page — allow-same-origin + allow-scripts
+              // together let that page's JS treat itself as genuinely
+              // same-origin with the real Flux app: reaching into
+              // window.parent's DOM, and making credentialed fetch()/XHR
+              // calls to /api/* that read real responses (feeds, settings,
+              // everything) instead of being blocked as cross-origin. The
+              // opaque sandboxed origin the omission produces is what
+              // actually protects the app by default; some sites behave
+              // worse without it (e.g. code that assumes persistent
+              // per-origin storage, or client-side theme prefs stored via
+              // localStorage/cookies — a known symptom is a page falling
+              // back to its default light theme regardless of the site's
+              // own dark-mode setting). Trusting a specific, deliberately
+              // chosen domain via the toggle is a reasonable trade for a
+              // site you actually trust; it should never be the default
+              // for arbitrary feed links.
+              //
+              // allow-top-navigation-by-user-activation is never included:
+              // the shim below intercepts link clicks and hands them to
+              // the system browser instead, so the iframe never needs
+              // permission to navigate the top-level page, trusted or not.
+              sandbox={`allow-scripts allow-forms allow-popups allow-pointer-lock${isTrusted ? ' allow-same-origin' : ''}`}
               style={{ flex:1, border:'none', background:'#fff' }}
               title="Inline browser"
             />
@@ -967,7 +974,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
           )}
           {!isMobile && (
             <div style={{ padding:'4px 12px', fontSize:11, color:T.textSubtle, background:T.surface, borderTop:`1px solid ${T.borderSubtle}`, flexShrink:0 }}>
-              Some sites block embedding entirely — if the page is blank, use ↗ to open it in a real browser tab.
+              Links open in your default browser · some sites block embedding entirely — if blank, use ↗
             </div>
           )}
           {isMobile && <div style={{ flexShrink:0, height:'calc(52px + env(safe-area-inset-bottom))' }} />}
@@ -978,7 +985,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, onStepBack, isMobile }
 }
 
 // ─── Reader Pane ──────────────────────────────────────────────────────────────
-function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRead, onToggleStar, onOpenRules, onSaveRule, settings, isMobile }) {
+function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRead, onToggleStar, onOpenRules, onSaveRule, onSaveSettings, settings, isMobile }) {
   const [content,    setContent]    = useState(null);
   const [loading,    setLoading]    = useState(false);
   const [error,      setError]      = useState(null);
@@ -1009,26 +1016,67 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
   useEffect(()=>{
     setContent(null); setError(null); setPickMode(false); setRuleWarning(null); setArticleSummary(null);
     setInlineBrow(false); setBrowUrl(null); setBrowStack([]);
+    suppressAutoMarkRef.current = false;
     // Always reset scroll to top — don't carry position from one article
     // to the next or from one view into a completely different article.
     if (readerScrollRef.current) readerScrollRef.current.scrollTop = 0;
     if (!article || article.isGroup) return;
 
-    // Mark read after a brief view delay, regardless of article type or
-    // whether it opens in the inline browser — previously this only
-    // happened on the Readability-fetch path, so inline-browser and
-    // YouTube articles never got marked read.
-    const markReadTimer = setTimeout(()=>onMarkRead(article.id, article.feedId), 1200);
-
-    if (article.isYoutube) return ()=>clearTimeout(markReadTimer);
+    if (article.isYoutube) return;
 
     // If feed uses inline browser, show that by default
-    if (feed?.inlineBrowser) { setInlineBrow(true); setBrowUrl(article.link); return ()=>clearTimeout(markReadTimer); }
+    if (feed?.inlineBrowser) { setInlineBrow(true); setBrowUrl(article.link); return; }
 
     loadArticleContent(article);
-
-    return ()=>clearTimeout(markReadTimer);
   },[article?.id]);
+
+  // Mark read on LEAVE, not on open — this effect's cleanup fires exactly
+  // when `article` changes (navigating to a different one) or the reader
+  // pane unmounts (closing it, switching views), which is precisely
+  // "leaving the article". Deliberately a separate effect from the one
+  // above: that one resets per-article UI state and kicks off content
+  // loading, which have nothing to do with read-tracking, and coupling
+  // them previously meant every article got marked read ~1.2s after
+  // opening regardless of whether you actually read it or immediately
+  // navigated past it.
+  //
+  // suppressAutoMarkRef: if the user explicitly toggles read/unread via the
+  // toolbar button while the article is open (see handleToggleReadManual
+  // below), that's a deliberate choice and should be the final word — this
+  // stops the cleanup below from unconditionally re-marking it read the
+  // instant they navigate away, which would otherwise silently undo an
+  // explicit "mark unread" within the same visit.
+  const suppressAutoMarkRef = useRef(false);
+  useEffect(()=>{
+    if (!article || article.isGroup) return;
+    const id = article.id, feedId = article.feedId;
+    return () => { if (!suppressAutoMarkRef.current) onMarkRead(id, feedId); };
+  },[article?.id, onMarkRead]);
+
+  // Closing the tab/window skips the cleanup above in some browsers (the
+  // page can be torn down before a fire-and-forget effect cleanup's async
+  // work is scheduled). `pagehide` fires reliably in that case, and
+  // sendBeacon queues the request to survive the page unloading — it
+  // rides on the session cookie (set alongside the bearer token at
+  // login/register) since sendBeacon can't set an Authorization header.
+  // Only applies to the plain web build. Electron's local IPC mode has no
+  // HTTP endpoint for this to hit, and Electron's *remote* HTTP mode would
+  // need an absolute base URL (not just this relative path) — both rely on
+  // the ordinary cleanup-based mark-read above instead, which is already
+  // correct there; this is purely an extra safety net for the tab-close
+  // case, which is specifically a web-tab concept.
+  useEffect(()=>{
+    if (api.isElectron) return;
+    if (!article || article.isGroup || article.isYoutube) return;
+    const flush = () => {
+      try {
+        navigator.sendBeacon?.('/api/articles/mark-read',
+          new Blob([JSON.stringify({ articleId: article.id, feedId: article.feedId })], { type: 'application/json' }));
+      } catch {}
+    };
+    window.addEventListener('pagehide', flush);
+    return () => window.removeEventListener('pagehide', flush);
+  },[article?.id, article?.feedId]);
 
   // Pulled out of the effect above so the manual inline-browser toggle can
   // also trigger it. Previously, switching a feed's default to inline
@@ -1041,7 +1089,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     api.articles.fetch({
       url:         art.link,
       feedId:      art.feedId,
-      rssFallback: { title: art.title, summary: art.summary },
+      rssFallback: { title: art.title, summary: art.summary, content: art.rssContent || null },
     })
       .then(r=>{ setContent(r); setLoading(false); })
       .catch(e=>{ setError(e.message); setLoading(false); });
@@ -1334,14 +1382,23 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     }
   },[article, content, feed, settings, runWithOllama]);
 
-  const handleCommitRule = useCallback(({selector, mode})=>{
+  const handleCommitRule = useCallback(async ({selector, mode})=>{
     if (!feed) return;
     const updated = {
       feedId: feed.id,
       cssSelectors: [...(feed.cssSelectors||[]), ...(mode==='block'||mode==='hide'?[selector]:[])],
       htmlPatterns: feed.htmlPatterns||[],
     };
-    onSaveRule(updated);
+    // MUST be awaited before re-fetching below: onSaveRule's PATCH request
+    // is what busts the server-side article-content cache for this feed's
+    // articles (see server/index.js's /api/feeds/:id handler). Previously
+    // this fired without awaiting, racing against the re-fetch call right
+    // after it — since the re-fetch is a simpler/faster request, it almost
+    // always won the race and read the still-cached pre-rule content,
+    // making the element picker look like it silently did nothing every
+    // single time (you can only reach the picker after already having
+    // viewed — and thus cached — the article you're picking from).
+    await onSaveRule(updated);
     setPickMode(false);
     setRuleWarning(null);
     // Re-fetch content with new rules
@@ -1412,11 +1469,11 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
       <div style={{ padding:'10px 20px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, flexShrink:0, background:T.surface }}>
         <IconBtn icon="←" title="Previous (k/←)" onClick={()=>navigate(-1)} size={28} />
         <IconBtn icon="→" title="Next (j/→)"     onClick={()=>navigate(1)}  size={28} />
-        {browStack.length>0&&<><Divider vertical margin={4}/><Btn small variant="outline" icon="↩" onClick={()=>{ const prev=browStack[browStack.length-1]; setBrowStack(s=>s.slice(0,-1)); setBrowUrl(prev||null); if (!prev) setInlineBrow(false); }}>Back</Btn></>}
         <Divider vertical margin={4} />
         <IconBtn icon={article.isStarred?'★':'☆'} title="Star" active={article.isStarred} onClick={()=>onToggleStar(article.id,article.feedId,!article.isStarred)} size={28} />
+        <IconBtn icon={article.isRead?'○':'●'} title={article.isRead?'Mark unread':'Mark read'} onClick={()=>{ suppressAutoMarkRef.current = true; onMarkRead(article.id,article.feedId,!article.isRead); }} size={28} />
         <IconBtn icon="↗" title="Open in default browser" onClick={()=>api.openExternal(article.link)} size={28} />
-        <IconBtn icon="◫" title="Inline browser (remembered per feed)"  active={inlineBrow&&!browStack.length}
+        <IconBtn icon="◫" title="Inline browser (remembered per feed)"  active={inlineBrow}
           onClick={()=>{
             const next = !inlineBrow;
             setInlineBrow(next);
@@ -1449,6 +1506,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
       {isMobile && mobileMoreMenu && (
         <ContextMenu x={mobileMoreMenu.x} y={mobileMoreMenu.y} onClose={()=>setMobileMoreMenu(null)} items={[
           { label: article.isStarred?'Unstar':'Star', icon: article.isStarred?'★':'☆', onClick:()=>onToggleStar(article.id,article.feedId,!article.isStarred) },
+          { label: article.isRead?'Mark unread':'Mark read', icon: article.isRead?'○':'●', onClick:()=>{ suppressAutoMarkRef.current = true; onMarkRead(article.id,article.feedId,!article.isRead); } },
           { label:'Open in default browser', icon:'↗', onClick:()=>api.openExternal(article.link) },
           { divider:true },
           { label:'Inline browser', icon:'◫', onClick:()=>{
@@ -1475,15 +1533,14 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
             key={article.id}
             url={browUrl}
             isMobile={isMobile}
+            trustedDomains={settings?.trustedInlineDomains || []}
+            onToggleTrust={(hostname, trust) => {
+              const current = settings?.trustedInlineDomains || [];
+              const next = trust ? [...new Set([...current, hostname])] : current.filter(d => d !== hostname);
+              onSaveSettings?.({ ...settings, trustedInlineDomains: next });
+            }}
             onClose={()=>{ setInlineBrow(false); setBrowUrl(null); setBrowStack([]); }}
             onNavigateArticle={navigate}
-            onStepBack={()=>{
-              if (!browStack.length) return;
-              const prev=browStack[browStack.length-1];
-              setBrowStack(s=>s.slice(0,-1));
-              setBrowUrl(prev||null);
-              if (!prev) setInlineBrow(false);
-            }}
           />
         </div>
       )}
@@ -1684,8 +1741,17 @@ function buildSelector(el, container) {
 
   const usableId = (node) => (node.id && !/^\d/.test(node.id) && !/^[a-f0-9]{6,}$/i.test(node.id))
     ? `#${CSS.escape(node.id)}` : null;
+  // Excludes classnames that are likely to be regenerated on the site's
+  // next build/deploy rather than being stable, hand-written names —
+  // picking one of these produces a rule that matches the exact page you
+  // picked it from but nothing afterward, which looks identical to "the
+  // rule just doesn't work." Beyond plain hex hashes and the styled-
+  // components/emotion prefixes already excluded: CSS Modules' typical
+  // `Component_className__hash` suffix pattern, and Next.js's styled-jsx
+  // `jsx-<hash>` classes.
   const usableClasses = (node) => [...node.classList].filter(c=>
-    c.length>1 && !/^[a-f0-9]{5,}$/.test(c) && !/^(css|sc|emotion|styled)-/.test(c) && !/^\d/.test(c));
+    c.length>1 && !/^[a-f0-9]{5,}$/.test(c) && !/^(css|sc|emotion|styled|jsx)-/.test(c) &&
+    !/__[a-z0-9]{5,}$/i.test(c) && !/^\d/.test(c));
 
   // The picked element itself is identifiable — no positional info needed.
   const ownId = usableId(el);
@@ -2109,16 +2175,24 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [editingUrl,setEditingUrl]=useState(false);
   const [url,setUrl]=useState(feed?.url||'');
   const [urlError,setUrlError]=useState(null);
+  const [name,setName]=useState(feed?.name||'');
+  const [thumbnailMode,setThumbnailMode]=useState(feed?.thumbnailMode||'inherit');
   const save=async()=>{
     setUrlError(null);
+    const trimmedName = name.trim();
+    if (!trimmedName) { setUrlError('Display name can\'t be empty'); return; }
     try {
-      await onSave({feedId:feed.id,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[], ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
+      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode, ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
       onClose();
     } catch(e) { setUrlError(e.message); }
   };
   return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <div style={{ background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:'10px 14px', fontSize:12, color:T.textMuted, lineHeight:1.6 }}>Rules are applied <strong style={{ color:T.text }}>before</strong> Readability extracts the article.</div>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Display name</label>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Feed name" style={{ width:'100%' }} />
+      </div>
       <div>
         <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Feed URL</label>
         {!editingUrl ? (
@@ -2143,6 +2217,15 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
         </select>
       </div>
       <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser for this feed</label>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead image in article list</label>
+        <select value={thumbnailMode} onChange={e=>setThumbnailMode(e.target.value)} style={{ width:'100%' }}>
+          <option value="inherit">Use global setting</option>
+          <option value="large">Above title, large</option>
+          <option value="small">Beside title, small</option>
+          <option value="none">Not at all</option>
+        </select>
+      </div>
       {feed?.isYoutube && (
         <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer', fontSize:13 }}>
           <input type="checkbox" checked={hideShorts} onChange={e=>setHideShorts(e.target.checked)} style={{ width:'auto', padding:0, marginTop:2 }} />
@@ -2309,9 +2392,11 @@ function SettingsModal({ settings, onSave, onClose }) {
   const [strategyOrder, setStrategyOrder] = useState(settings.fetchStrategyOrder?.length ? settings.fetchStrategyOrder : FETCH_STRATEGY_NAMES_FALLBACK);
   const [clusterMaxDaysApart, setClusterMaxDaysApart] = useState(settings.clusterMaxDaysApart ?? 3);
   const [clusterSameSource, setClusterSameSource] = useState(!(settings.clusterExcludeSameSource !== false)); // UI shows the positive framing ("group same-source together")
+  const [titleBlocklist, setTitleBlocklist] = useState((settings.titleBlocklist || []).join('\n'));
+  const [listThumbnailMode, setListThumbnailMode] = useState(settings.listThumbnailMode || 'large');
 
   const save = async () => {
-    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource });
+    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), listThumbnailMode });
     onClose();
   };
 
@@ -2359,6 +2444,21 @@ function SettingsModal({ settings, onSave, onClose }) {
               ? "Ollama will be started automatically when you use an AI feature, without asking first. It'll be stopped when done."
               : "When you use an AI feature, Flux will ask before starting Ollama. Turn this on to skip the prompt."} />
         </div>
+      </div>
+
+      <Divider margin={2} />
+
+      <div>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:10 }}>Display</div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead images in article list</label>
+        <div style={{ fontSize:11, color:T.textMuted, marginBottom:8, lineHeight:1.5 }}>
+          Shows each article's thumbnail/lead image in the list, when the feed provides one (any feed with a media:thumbnail or enclosure image — not just YouTube). Individual feeds can override this in their own feed settings.
+        </div>
+        <select value={listThumbnailMode} onChange={e=>setListThumbnailMode(e.target.value)} style={{ width:'100%' }}>
+          <option value="large">Above title, large</option>
+          <option value="small">Beside title, small</option>
+          <option value="none">Not at all</option>
+        </select>
       </div>
 
       <Divider margin={2} />
@@ -2418,6 +2518,16 @@ function SettingsModal({ settings, onSave, onClose }) {
           override this in their feed settings.
         </div>
         <StrategyOrderPicker order={strategyOrder} onChange={setStrategyOrder} />
+      </div>
+
+      <Divider margin={2} />
+
+      <div>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:6 }}>Filtering</div>
+        <div style={{ fontSize:11, color:T.textMuted, marginBottom:8, lineHeight:1.5 }}>
+          Hide articles whose title matches any of these patterns (one per line, case-insensitive regex), across every feed. For a single feed only, use that feed's own settings instead — this list is combined with, not a replacement for, per-feed blocklists.
+        </div>
+        <textarea value={titleBlocklist} onChange={e=>setTitleBlocklist(e.target.value)} placeholder={`^\\[Sponsor\\]\nSponsored Post`} style={{ width:'100%', height:60, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
       </div>
 
       {api.isRemoteHttp() && <AccountSection />}
@@ -2739,13 +2849,33 @@ function FilterBar({ filters, onChange, feedsInView, showAiFilter }) {
 }
 
 // ─── Mobile breakpoint hook ───────────────────────────────────────────────────
+// Checks the SHORTER of the two viewport dimensions rather than raw width.
+// A phone's short side is physically fixed regardless of orientation — only
+// which axis (width vs height) it's currently measured on changes when you
+// rotate — so this stays stable across rotation. Checking width alone
+// doesn't: many phones' landscape width exceeds typical breakpoints (an
+// iPhone Pro is ~393px wide in portrait but ~852px in landscape, well past
+// any reasonable "mobile" cutoff), so a plain `innerWidth < 768` check would
+// flip `mobile` to false the instant you rotated to landscape. Since the
+// top-level render swaps between MobileLayout and the full 3-pane desktop
+// layout based on this value (see `if (isMobile) return <MobileLayout .../>`
+// below), that flip unmounts the entire mobile navigation stack mid-
+// rotation — which is exactly what "rotating during YouTube fullscreen
+// kicks you back to the feed view" was: not a video-player or fullscreen
+// bug at all, just the layout itself swapping out from under it.
 function useIsMobile() {
-  const [mobile, setMobile] = useState(()=>window.innerWidth < 768);
+  const getIsMobile = () => Math.min(window.innerWidth, window.innerHeight) < 768;
+  const [mobile, setMobile] = useState(getIsMobile);
   useEffect(()=>{
-    const mq = window.matchMedia('(max-width: 767px)');
-    const h = (e) => setMobile(e.matches);
-    mq.addEventListener('change', h);
-    return ()=>mq.removeEventListener('change', h);
+    // matchMedia's 'change' event only fires when that one query's own
+    // match state changes — it can't express "shorter dimension," so this
+    // recomputes directly off a resize listener instead (rotation fires
+    // resize same as any other viewport change, no separate handling
+    // needed for it specifically).
+    const h = () => setMobile(getIsMobile());
+    window.addEventListener('resize', h);
+    window.addEventListener('orientationchange', h);
+    return ()=>{ window.removeEventListener('resize', h); window.removeEventListener('orientationchange', h); };
   },[]);
   return mobile;
 }
@@ -3001,7 +3131,7 @@ function MobileLayout({
       <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', paddingBottom:56 }}>
         {visibleArticles.length===0 && <div style={{ padding:40, textAlign:'center', color:T.textSubtle }}>Nothing here.</div>}
         {visibleArticles.map(a => (
-          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} isSelected={false} onClick={()=>goToArticle(a)} />
+          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} isSelected={false} onClick={()=>goToArticle(a)} settings={settings} />
         ))}
       </div>
     </div>
@@ -3024,6 +3154,7 @@ function MobileLayout({
         onToggleStar={onToggleStar}
         onOpenRules={setRulesTarget}
         onSaveRule={onSaveRules}
+        onSaveSettings={handleSaveSettings}
         settings={settings}
         isMobile
       />
@@ -3223,6 +3354,13 @@ export default function App() {
     setRefreshing(true);
     const readSet  = new Set(state?.read    || []);
     const starSet  = new Set(state?.starred || []);
+    // Captured explicitly rather than read back from articlesRef.current
+    // afterward — that ref only updates via a useEffect that fires on the
+    // *next* render commit, so immediately after the setArticles() calls
+    // below (still within this same synchronous function run) it would
+    // still reflect whatever articles were current before this refresh
+    // started, not what was just fetched.
+    let finalArticlesForCache = null;
 
     try {
       if (api.isElectron) {
@@ -3272,7 +3410,9 @@ export default function App() {
         unsub(); // clean up listener
 
         // Final dedup pass in case of any last stragglers
-        setArticles(prev => articleState.mergeArticlesWithState(prev, [], readSet, starSet));
+        const deduped = articleState.mergeArticlesWithState(accumulated, [], readSet, starSet);
+        setArticles(deduped);
+        finalArticlesForCache = deduped;
 
       } else {
         // ── Batch path (web server) ───────────────────────────────────────
@@ -3294,7 +3434,9 @@ export default function App() {
           isRead:    readSet.has(`${item.feedId}:${item.id}`),
           isStarred: starSet.has(`${item.feedId}:${item.id}`),
         })));
-        setArticles(articleState.mergeArticlesWithState(articlesRef.current, allItems, readSet, starSet));
+        const merged = articleState.mergeArticlesWithState(articlesRef.current, allItems, readSet, starSet);
+        setArticles(merged);
+        finalArticlesForCache = merged;
       }
 
       // AI clustering — opt-in only, runs after articles are visible
@@ -3310,8 +3452,22 @@ export default function App() {
         } catch { setClusterState(null); }
       }
 
-    } finally { setRefreshing(false); }
-  },[settings]);
+    } finally {
+      setRefreshing(false);
+      // This is the fix for "cached articles should show while fetching new
+      // ones": that mechanism (seeding articles/feeds state from
+      // localStorage on mount, see _cached above) was already fully wired
+      // up on the *reading* side, but saveCache — the function that
+      // actually writes to that localStorage key — was never called
+      // anywhere in the app. The cache was permanently empty, so every
+      // single load started from a blank article list regardless of how
+      // recently you'd last used the app, no matter how well the seeding
+      // logic itself worked. feeds_ is read fresh here rather than
+      // threading feedList through, since feedList is this call's
+      // snapshot from before any favicon updates just landed.
+      if (finalArticlesForCache) saveCache({ articles: finalArticlesForCache, feeds: feeds_ });
+    }
+  },[settings, feeds_]);
 
   useEffect(()=>{
     if (authState !== 'ok') return;
@@ -3320,6 +3476,7 @@ export default function App() {
         setFeeds(f); setFolders(fo);
         const merged = { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaAutoStart:false, ollamaUrl:'', ollamaModel:'', ...(s||{}) };
         setSettings(merged);
+        saveCache({ feeds: f, folders: fo, settings: merged });
         if(f.length>0) refreshFeeds(f,state,merged);
       });
   },[authState]);
@@ -3341,17 +3498,23 @@ export default function App() {
     const mins = settings.refreshIntervalMinutes ?? 30;
     if (!mins || mins < 1 || feeds_.length === 0) return;
     autoRefreshRef.current = setInterval(async ()=>{
-      const prevCount = articles.length;
+      // Diffing by ID set rather than array length — length delta breaks
+      // in two common, opposite ways: (1) a feed that only keeps its last
+      // N items rolling old ones off the same moment new ones arrive nets
+      // to zero length change even with several genuinely new articles
+      // (undercounts, sometimes to exactly zero); (2) a feed recovering
+      // from a previous transient fetch failure suddenly contributes all
+      // its items at once, none of which are actually new (overcounts).
+      // Comparing which IDs are new is correct regardless of what else
+      // simultaneously changed in feed contents.
+      const prevIds = new Set(articlesRef.current.map(a=>a.id));
       const state = await api.articles.getState();
       await refreshFeeds(feeds_, state);
-      // Brief delay so refreshFeeds has settled
-      setTimeout(()=>{
-        setArticles(curr => {
-          const diff = curr.length - prevCount;
-          if (diff > 0) setNewArticleCount(n => n + diff);
-          return curr;
-        });
-      }, 500);
+      setArticles(curr => {
+        const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
+        if (newCount > 0) setNewArticleCount(n => n + newCount);
+        return curr;
+      });
     }, mins * 60 * 1000);
     return () => clearInterval(autoRefreshRef.current);
   },[settings.refreshIntervalMinutes, feeds_.length]);
@@ -3415,14 +3578,38 @@ export default function App() {
     setFeeds(prev=>prev.map(f=>f.id===feedId?{...f,folder:folderId}:f));
   };
 
-  const handleMarkRead = useCallback(async(articleId, feedId)=>{
-    setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isRead:true}:a));
-    await api.articles.markRead({articleId, feedId});
+  // Both of these previously called their persistence request with a bare
+  // `await` and no try/catch. The optimistic setArticles() call above it
+  // already made the article look read/starred in the UI, so if the
+  // network call then silently rejected (a transient blip, a cold-start
+  // timing hiccup, anything), there was no visible symptom at all *in this
+  // session* — but the state was never actually written server-side, so it
+  // reverted the moment the app was reloaded. That silent-failure gap is
+  // the most likely explanation for "read state doesn't persist": not a
+  // logic bug in how state is restored, but persistence calls occasionally
+  // failing with nothing catching or retrying them. One retry after a
+  // short delay covers the common transient case; a final failure now at
+  // least surfaces as a toast instead of vanishing outright.
+  const persistWithRetry = useCallback(async (fn, label) => {
+    try { await fn(); return; } catch {}
+    await new Promise(r => setTimeout(r, 800));
+    try { await fn(); }
+    catch (e) {
+      // Note: no app-level toast surface exists here (the one toast state
+      // in this file is scoped to ReaderPane, a different component) — if
+      // this warrants a visible UI notice later, wire a toast up at the
+      // App level rather than reaching into ReaderPane's local state.
+      console.warn(`[flux] failed to persist ${label} after retry — it may revert on reload:`, e);
+    }
   },[]);
+  const handleMarkRead = useCallback(async(articleId, feedId, read=true)=>{
+    setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isRead:read}:a));
+    await persistWithRetry(() => api.articles.markRead({articleId, feedId, read}), 'read state');
+  },[persistWithRetry]);
   const handleToggleStar  = useCallback(async(articleId, feedId, starred)=>{
     setArticles(prev=>prev.map(a=>a.id===articleId?{...a,isStarred:starred}:a));
-    await api.articles.toggleStar({articleId, feedId, starred});
-  },[]);
+    await persistWithRetry(() => api.articles.toggleStar({articleId, feedId, starred}), 'starred state');
+  },[persistWithRetry]);
   const handleSaveRules   = async(rules)=>{
     await api.feeds.updateRules(rules);
     setFeeds(prev=>prev.map(f=>f.id===rules.feedId?{...f,...rules}:f));
@@ -3454,18 +3641,13 @@ export default function App() {
     else if (activeView.startsWith('folder:')){ const fid=activeView.slice(7); result = articles.filter(a=>feeds_.find(f=>f.id===a.feedId)?.folder===fid); }
     else result = articles;
 
-    // Per-feed "hide shorts" and title-blocklist filtering — applied
-    // regardless of other view/status filters, since these represent
-    // "never show me this" rather than a temporary view toggle.
+    // Global + per-feed "hide shorts" and title-blocklist filtering —
+    // applied regardless of other view/status filters, since these
+    // represent "never show me this" rather than a temporary view toggle.
     result = result.filter(a=>{
       const feed = feeds_.find(f=>f.id===a.feedId);
       if (feed?.hideShorts && a.isShort) return false;
-      if (feed?.titleBlocklist?.length) {
-        for (const pattern of feed.titleBlocklist) {
-          try { if (new RegExp(pattern, 'i').test(a.title)) return false; }
-          catch { /* invalid regex in the blocklist — ignore rather than crash filtering */ }
-        }
-      }
+      if (titleIsBlocked(a.title, feed, settings)) return false;
       return true;
     });
 
@@ -3486,9 +3668,9 @@ export default function App() {
   const baseFilteredArticles = useMemo(()=>articles.filter(a=>{
     const feed=feeds_.find(f=>f.id===a.feedId);
     if (feed?.hideShorts&&a.isShort) return false;
-    if (feed?.titleBlocklist?.length) for (const p of feed.titleBlocklist) { try { if(new RegExp(p,'i').test(a.title)) return false; } catch {} }
+    if (titleIsBlocked(a.title, feed, settings)) return false;
     return true;
-  }),[articles,feeds_]);
+  }),[articles,feeds_,settings]);
 
   // Marks only the articles currently visible (respecting whatever
   // folder/feed/filter view is active) as read — not every article in the
@@ -3503,10 +3685,17 @@ export default function App() {
     if (!idsToMark.length) return;
     const idSet = new Set(idsToMark.map(x=>x.id));
     setArticles(prev=>prev.map(a=>idSet.has(a.id)?{...a,isRead:true}:a));
-    // Fire all persistence calls in parallel — these are independent
-    // per-article writes, no need to serialize them.
-    await Promise.all(idsToMark.map(({id,feedId})=>api.articles.markRead({articleId:id, feedId}).catch(e=>console.warn('Failed to persist read state for', id, e))));
-  },[visibleArticles]);
+    // Previously this fired one HTTP request + one DB write per article in
+    // parallel (Promise.all over up to hundreds of items), with individual
+    // failures only console.warn'd and never retried. A burst that size
+    // has a real chance of a handful of requests failing under connection-
+    // pool limits or a transient blip, and with no retry those articles
+    // would silently revert to unread on the next reload — exactly the
+    // reported symptom. Now a single batched request with one retry,
+    // matching handleMarkRead's persistWithRetry above.
+    const items = idsToMark.map(({id,feedId})=>({articleId:id, feedId}));
+    await persistWithRetry(() => api.articles.markReadBulk(items), 'read state for all articles');
+  },[visibleArticles, persistWithRetry]);
 
   if (authState === 'checking') {
     return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh', background:T.bg, color:T.textSubtle, fontSize:13 }}>
@@ -3556,8 +3745,8 @@ export default function App() {
     <SpeedInsights />
     <div style={{ display:'flex', height:'100vh', overflow:'hidden' }}>
       <Sidebar folders={folders_} feeds={feeds_} articles={articles} activeView={activeView} onSelectView={(v)=>{ setActiveView(v); setArticleListCollapsed(false); }} onOpenAddFeed={(folder)=>setShowAddFeed(folder&&folder.id?folder:true)} onAddToFolder={(folder)=>setAddToFolderTarget(folder)} onRefreshAll={handleRefreshAll} refreshing={refreshing} onExportOPML={handleExportOPML} onImportOPML={handleImportOPML} onNewFolder={()=>setShowNewFolder(true)} onOpenSettings={()=>setShowSettings(true)} onFeedSettings={setRulesTarget} onRemoveFeed={handleRemoveFeed} onRemoveFolder={handleRemoveFolder} onManageFolderFeeds={setManageFolderTarget} newArticleCount={newArticleCount} settings={settings} onReorderFolders={handleReorderFolders} onEditFolder={setEditFolderTarget} />
-      <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} />
-      <ReaderPane article={selectedArticle} feed={feeds_.find(f=>f.id===selectedArticle?.feedId)} allArticles={visibleArticles} allFeeds={feeds_} onNavigate={setSelectedArticle} onMarkRead={handleMarkRead} onToggleStar={handleToggleStar} onOpenRules={setRulesTarget} onSaveRule={handleSaveRules} settings={settings} />
+      <ArticleList articles={visibleArticles} activeView={activeView} feeds={feeds_} folders={folders_} onSelect={setSelectedArticle} selectedId={selectedArticle?.id} onMarkAllRead={handleMarkAllRead} filters={filters} onFiltersChange={setFilters} showAiFilter={settings.aiClusteringEnabled} onOpenFeedSettings={setRulesTarget} collapsed={articleListCollapsed} onToggleCollapse={setArticleListCollapsed} deArrowEnabled={!!settings.deArrowEnabled} settings={settings} />
+      <ReaderPane article={selectedArticle} feed={feeds_.find(f=>f.id===selectedArticle?.feedId)} allArticles={visibleArticles} allFeeds={feeds_} onNavigate={setSelectedArticle} onMarkRead={handleMarkRead} onToggleStar={handleToggleStar} onOpenRules={setRulesTarget} onSaveRule={handleSaveRules} onSaveSettings={handleSaveSettings} settings={settings} />
     </div>
 
     {refreshing&&<div style={{ position:'fixed', bottom:16, right:16, background:T.surface, border:`1px solid ${T.border}`, borderRadius:8, padding:'8px 12px', display:'flex', alignItems:'center', gap:8, fontSize:12, color:T.textMuted, boxShadow:'0 4px 16px rgba(0,0,0,.3)', zIndex:50 }}><Spinner size={12}/>Fetching feeds…</div>}
