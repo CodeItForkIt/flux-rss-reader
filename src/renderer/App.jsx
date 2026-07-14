@@ -483,6 +483,9 @@ function FolderGroup({ folder, feeds, unreadTotal, unreadPerFeed, activeView, on
       {!collapsed&&<>
         <span style={{ flex:1, fontSize:11, fontWeight:600, color:isActive?T.accent:T.textSubtle, letterSpacing:'0.05em', textTransform:'uppercase', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{folder.name}</span>
         {unreadTotal>0&&!open&&<span style={{ fontSize:10, color:T.textSubtle }}>{unreadTotal}</span>}
+        {h&&<span onClick={e=>{e.stopPropagation();onFolderContextMenu(e,folder);}} title="Folder options" style={{ fontSize:11, color:T.textSubtle, padding:'2px 5px', cursor:'pointer', borderRadius:4, flexShrink:0 }}
+          onMouseEnter={e=>{e.currentTarget.style.background=T.surfaceActive;e.currentTarget.style.color=T.text;}}
+          onMouseLeave={e=>{e.currentTarget.style.background='transparent';e.currentTarget.style.color=T.textSubtle;}}>⚙</span>}
         <span onClick={toggleOpen} style={{ fontSize:10, color:T.textSubtle, transition:'transform 0.15s', transform:open?'rotate(0deg)':'rotate(-90deg)', padding:'2px 4px', cursor:'pointer', flexShrink:0 }}>▾</span>
       </>}
     </div>
@@ -648,6 +651,17 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   const dearrow = useDeArrow(isYt ? article.videoId : null, !!deArrowEnabled);
   const displayTitle = (deArrowEnabled && dearrow?.title) ? dearrow.title : article.title;
   const displayThumb = (deArrowEnabled && dearrow?.thumb) ? dearrow.thumb : article.thumbnail;
+  // Previously onError only hid the <img> itself, leaving its parent — a
+  // fixed-size box with its own background color — visible as an empty
+  // placeholder any time a thumbnail URL was broken/404'd/timed out. This
+  // tracks failure explicitly so the *whole* container can be skipped,
+  // matching "don't show an image if there isn't one" for the case where
+  // there technically is a URL but it doesn't actually load. Resets
+  // whenever the thumbnail URL itself changes (e.g. DeArrow toggling
+  // between the feed's own thumbnail and DeArrow's replacement) rather
+  // than staying stuck on a stale failure from a since-changed URL.
+  const [imgFailed, setImgFailed] = useState(false);
+  useEffect(()=>{ setImgFailed(false); },[displayThumb]);
   // Per-feed thumbnailMode overrides the global setting; null/undefined
   // inherits it. Previously this was YouTube-only even though thumbnail
   // extraction itself (see fetchFeed in core/fetcher.js) already pulls
@@ -657,7 +671,7 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // is the default, matching the only style that existed before this was
   // configurable.
   const mode = feed?.thumbnailMode || settings?.listThumbnailMode || 'large';
-  const showThumb = mode !== 'none' && !!displayThumb;
+  const showThumb = mode !== 'none' && !!displayThumb && !imgFailed;
 
   const metaRow = <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
     <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.04em', color:isYt?T.youtube:T.accent, textTransform:'uppercase' }}>{feed?.name||domainOf(article.link)}</span>
@@ -679,7 +693,7 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // tablet) the image could scale up to a genuinely oversized block that
   // dwarfed the actual text content it was supposed to be a preview for.
   const largeThumb = showThumb && <div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
     {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
     {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
   </div>;
@@ -687,7 +701,7 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // 'small': a fixed square thumbnail beside the title/meta/summary block,
   // the compact layout style most readers (Reeder, NetNewsWire, etc.) use.
   const smallThumb = showThumb && <div style={{ width:52, height:52, borderRadius:6, overflow:'hidden', background:T.bg, flexShrink:0, position:'relative' }}>
-    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
     {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:18, height:18, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:8 }}>▶</div></div>}
   </div>;
 
@@ -710,9 +724,15 @@ function GroupRow({ group, feeds, isSelected, onClick }) {
   const isYt = top.isYoutube;
   const sourceNames = [...new Set(group.members.map(m=>feeds.find(f=>f.id===m.feedId)?.name || domainOf(m.link)))];
   const anyUnread = group.members.some(m=>!m.isRead);
+  // See the matching comment in ArticleRow — onError previously only hid
+  // the <img>, leaving its fixed-size, background-colored parent visible
+  // as an empty placeholder box for any broken/404'd thumbnail URL.
+  const [imgFailed, setImgFailed] = useState(false);
+  useEffect(()=>{ setImgFailed(false); },[top.thumbnail]);
+  const showThumb = isYt && top.thumbnail && !imgFailed;
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
-    {isYt&&top.thumbnail&&<div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-      <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={e=>{e.target.style.display='none';}} />
+    {showThumb&&<div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
+      <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
     </div>}
     <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
       <Badge tone="ai" tiny>◆ {group.members.length} sources</Badge>
@@ -2174,17 +2194,20 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [strategyOrder,setStrategyOrder]=useState(feed?.fetchStrategyOrder?.length?feed.fetchStrategyOrder:FETCH_STRATEGY_NAMES_FALLBACK);
   const [editingUrl,setEditingUrl]=useState(false);
   const [url,setUrl]=useState(feed?.url||'');
-  const [urlError,setUrlError]=useState(null);
+  const [saveError,setSaveError]=useState(null);
+  const [saving,setSaving]=useState(false);
   const [name,setName]=useState(feed?.name||'');
   const [thumbnailMode,setThumbnailMode]=useState(feed?.thumbnailMode||'inherit');
   const save=async()=>{
-    setUrlError(null);
+    setSaveError(null);
     const trimmedName = name.trim();
-    if (!trimmedName) { setUrlError('Display name can\'t be empty'); return; }
+    if (!trimmedName) { setSaveError('Display name can\'t be empty'); return; }
+    setSaving(true);
     try {
       await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode, ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
       onClose();
-    } catch(e) { setUrlError(e.message); }
+    } catch(e) { setSaveError(e.message || 'Save failed — please try again.'); }
+    finally { setSaving(false); }
   };
   return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
@@ -2202,10 +2225,9 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
           </div>
         ) : (
           <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-            <input value={url} onChange={e=>{setUrl(e.target.value);setUrlError(null);}} style={{ width:'100%', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
+            <input value={url} onChange={e=>{setUrl(e.target.value);setSaveError(null);}} style={{ width:'100%', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
             <div style={{ fontSize:11, color:T.textMuted }}>Changing this points the feed at a different source — existing articles stay, new ones come from the new URL.</div>
-            {urlError && <div style={{ fontSize:11, color:T.danger }}>{urlError}</div>}
-            <div><Btn small variant="outline" onClick={()=>{setEditingUrl(false);setUrl(feed?.url||'');setUrlError(null);}}>Cancel change</Btn></div>
+            <div><Btn small variant="outline" onClick={()=>{setEditingUrl(false);setUrl(feed?.url||'');setSaveError(null);}}>Cancel change</Btn></div>
           </div>
         )}
       </div>
@@ -2267,7 +2289,8 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
       </div>
       <div><label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>CSS selectors to remove</label><textarea value={css} onChange={e=>setCss(e.target.value)} placeholder={`.paywall-overlay\n.subscription-modal\n#cookie-banner`} style={{ width:'100%', height:110, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} /></div>
       <div><label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>HTML text patterns (regex)</label><textarea value={html} onChange={e=>setHtml(e.target.value)} placeholder="Subscribe to read more" style={{ width:'100%', height:80, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} /></div>
-      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}><Btn variant="outline" onClick={onClose}>Cancel</Btn><Btn variant="primary" onClick={save}>Save</Btn></div>
+      {saveError && <div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{saveError}</div>}
+      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}><Btn variant="outline" onClick={onClose}>Cancel</Btn><Btn variant="primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</Btn></div>
     </div>
   </Modal>;
 }
@@ -3343,10 +3366,24 @@ export default function App() {
   const [manageFolderTarget,setManageFolderTarget] = useState(null);
   const [addToFolderTarget,setAddToFolderTarget] = useState(null);
   const [settings,setSettings] = useState(_cached.settings || { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaUrl:'', ollamaModel:'' });
-  const [filtersByView,setFiltersByView] = useState({});
+  // Per-view (which includes per-feed and per-folder, since activeView is
+  // 'feed:<id>' / 'folder:<id>' / a built-in view name) filter/sort memory
+  // already existed as in-memory React state — switching feeds within a
+  // session correctly remembered a separate filter for each one. It just
+  // never survived a reload, since nothing ever persisted it anywhere.
+  // localStorage here, matching the existing _cached/saveCache pattern
+  // used for feeds/folders/articles/settings above.
+  const FILTERS_KEY = 'flux-filters-by-view-v1';
+  const [filtersByView,setFiltersByView] = useState(()=>{
+    try { return JSON.parse(localStorage.getItem(FILTERS_KEY)) || {}; } catch { return {}; }
+  });
 
   const filters = filtersByView[activeView] || DEFAULT_FILTERS;
-  const setFilters = (f) => setFiltersByView(prev=>({ ...prev, [activeView]: f }));
+  const setFilters = (f) => setFiltersByView(prev=>{
+    const next = { ...prev, [activeView]: f };
+    try { localStorage.setItem(FILTERS_KEY, JSON.stringify(next)); } catch {}
+    return next;
+  });
 
 
   const refreshFeeds = useCallback(async(feedList, state, settingsOverride)=>{

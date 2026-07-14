@@ -370,17 +370,20 @@ async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
   // when this was captured at feed-fetch time, so a feed that only ever
   // supplies a short teaser in its RSS still falls through to the normal
   // live-fetch behavior below, unchanged.
-  if (rssFallback?.content && stripHtml(rssFallback.content).trim().length > 400) {
-    const text = rssFallback.content;
-    return {
-      title:       rssFallback.title  || '',
-      byline:      rssFallback.byline || '',
-      content:     sanitizeArticleHtml(text),
-      excerpt:     stripHtml(text).trim().slice(0, 300),
-      siteName:    '',
-      bypassSource:'rss-content',
-      length:      stripHtml(text).trim().length,
-    };
+  if (rssFallback?.content) {
+    const strippedContent = stripHtml(rssFallback.content).trim();
+    if (strippedContent.length > 400 && !looksLikeTeaser(strippedContent)) {
+      const text = rssFallback.content;
+      return {
+        title:       rssFallback.title  || '',
+        byline:      rssFallback.byline || '',
+        content:     sanitizeArticleHtml(text),
+        excerpt:     strippedContent.slice(0, 300),
+        siteName:    '',
+        bypassSource:'rss-content',
+        length:      strippedContent.length,
+      };
+    }
   }
 
   let html, source;
@@ -722,8 +725,8 @@ async function fetchFeed(feedConfig, cookieJars) {
     // it's substantial, so fetchArticle can prefer it — see the matching
     // comment there for the size heuristic.
     const rawContent = item['content:encoded'] || item.content || '';
-    const strippedLen = stripHtml(rawContent).trim().length;
-    const rssContent = strippedLen > 400 ? rawContent : null;
+    const strippedContent = stripHtml(rawContent).trim();
+    const rssContent = (strippedContent.length > 400 && !looksLikeTeaser(strippedContent)) ? rawContent : null;
 
     return {
       id:         `${feedConfig.id}__${stableKey}`,
@@ -795,6 +798,26 @@ function decodeHtmlEntities(str) {
     '&mdash;':'—','&ndash;':'–','&ldquo;':'"','&rdquo;':'"','&lsquo;':'\u2018','&rsquo;':'\u2019',
     '&hellip;':'…','&copy;':'©','&reg;':'®','&trade;':'™','&bull;':'•','&middot;':'·' };
   return str.replace(/&[a-z]+;/gi, e => named[e] ?? e);
+}
+
+// Distinguishes genuine full RSS content from a long-but-truncated preview
+// that happens to clear a plain length threshold. Length alone isn't
+// enough — plenty of publishers (The Verge among them) deliberately
+// truncate their feed content to several substantial paragraphs specifically
+// to encourage clicking through, ending in a "Read more at [Site]" or
+// similar CTA. Checking length alone was what regressed The Verge: their
+// teaser is long enough to clear a size-only bar, so it got mistaken for
+// the genuine full-content case (Daring Fireball's Linked List, which this
+// was originally built for) and shown instead of live-fetching the real
+// article — cutting every article off exactly where the site's own
+// truncation did.
+function looksLikeTeaser(strippedText) {
+  const tail = strippedText.slice(-220);
+  return /\bread\s+(more|the\s+rest|full\s+story|the\s+full\s+article)\b/i.test(tail)
+      || /\bcontinue\s+reading\b/i.test(tail)
+      || /\bappeared\s+first\s+on\b/i.test(tail)        // WordPress default excerpt suffix
+      || /\[\s*(…|\.\.\.)\s*\]\s*$/.test(strippedText)  // "[…]" / "[...]" right at the end
+      || (/(…|\.\.\.)\s*$/.test(tail) && tail.length < 220); // trails off with an ellipsis near a short remainder
 }
 
 function stripHtml(str) {
