@@ -143,7 +143,14 @@ const articleCache = {
 // truncates their feed content with a "Read more" CTA) to regress, since
 // their teaser is long enough to clear a size-only bar. Articles cached
 // under version 2 have that wrongly-truncated result baked in.
-const ARTICLE_CONTENT_CACHE_VERSION = 3;
+// Current bump: switched RSS-content preference from an automatic
+// length+pattern heuristic to an explicit per-feed opt-in
+// (feedRules.preferFeedContent) — see the comment in fetcher.js's
+// fetchArticle for why. Every feed that isn't explicitly opted in now
+// always live-fetches, same as the pre-DF-fix original behavior; anything
+// cached under version 3 could have RSS content applied that wouldn't be
+// applied anymore under the new logic.
+const ARTICLE_CONTENT_CACHE_VERSION = 4;
 const articleContentCacheKey = (url) => `v${ARTICLE_CONTENT_CACHE_VERSION}::${url}`;
 
 // getSettings() is called on nearly every article-fetch request just to
@@ -212,6 +219,22 @@ async function articleTtlMs(userId) {
 // auto-refresh timer, both of which pass force:true to bypass it entirely.
 const FEED_CACHE_TTL_MS = 3 * 60 * 1000;
 const feedCacheKey = (userId, feedId) => `flux-feed-cache::${userId}::${feedId}`;
+// Checks the actual hostname rather than doing a substring match against
+// the full URL. feed.url.includes('youtube.com') (the previous check) can
+// be fooled by any URL containing that substring anywhere at all —
+// https://evil.com/?x=youtube.com or https://youtube.com.evil.com/feed
+// both pass a naive .includes() check without being youtube.com at all.
+// That matters here specifically because a feed classified as "YouTube"
+// gets its items' link fields fetched directly by fetchYoutubeVideoDuration
+// below — a feed that fooled this check controls the content it points
+// that fetch at.
+function isGenuineYoutubeFeedUrl(feedUrl) {
+  try {
+    const h = new URL(feedUrl).hostname.toLowerCase();
+    return h === 'youtube.com' || h.endsWith('.youtube.com');
+  } catch { return false; }
+}
+
 async function fetchFeedCached(userId, feed, cookieJars, force) {
   const key = feedCacheKey(userId, feed.id);
   if (!force) {
@@ -240,7 +263,7 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
   // Durations found in cache are attached synchronously so they appear on
   // this very response; newly-fetched ones are cached in the background
   // and will appear starting next refresh.
-  if (feed.isYoutube || feed.url.includes('youtube.com')) {
+  if (feed.isYoutube || isGenuineYoutubeFeedUrl(feed.url)) {
     const candidates = (result.items || []).filter(item => item.videoId && !item.duration).slice(0, 10);
     const durKeys = candidates.map(item => `flux-video-duration::${item.videoId}`);
     const cachedDurations = await Promise.all(durKeys.map(k => articleCache.get(k).catch(() => null)));
@@ -248,10 +271,17 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
     candidates.forEach((item, i) => {
       if (cachedDurations[i]?.result) { item.duration = cachedDurations[i].result; return; }
       if (fetchBudget-- <= 0) return;
-      fetchYoutubeVideoDuration(item.link, cookieJars).then(duration => {
+      // item.link is feed content, not a URL this server constructed
+      // itself — checked the same as any other feed-supplied URL before
+      // being fetched.
+      (async () => {
+        let hostname;
+        try { hostname = new URL(item.link).hostname; } catch { return; }
+        if (await checkSsrfSafe(hostname)) return;
+        const duration = await fetchYoutubeVideoDuration(item.link, cookieJars);
         if (!duration) return;
-        articleCache.set(durKeys[i], { ts: Date.now(), feedId: null, result: duration }).catch(() => {});
-      }).catch(() => {});
+        await articleCache.set(durKeys[i], { ts: Date.now(), feedId: null, result: duration });
+      })().catch(() => {});
     });
   }
 
@@ -267,7 +297,7 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
   // block won't fire again for that feed. This was previously dead code:
   // fetchFeedAvatar existed but nothing anywhere ever called it, so every
   // YouTube feed was permanently stuck on the generic fallback icon.
-  if (!feed.favicon && (feed.isYoutube || feed.url.includes('youtube.com'))) {
+  if (!feed.favicon && (feed.isYoutube || isGenuineYoutubeFeedUrl(feed.url))) {
     fetchFeedAvatar(feed, cookieJars).then(async (avatarUrl) => {
       if (!avatarUrl) return;
       try { await db.updateFeed(userId, feed.id, { favicon: avatarUrl }); }
@@ -705,11 +735,17 @@ app.patch('/api/feeds/:id', async (req, res) => {
   // previously did nothing at all (stale from before the feed-cache
   // existed as its own keyed store).
   if (url !== undefined) await articleCache.delete(feedCacheKey(req.userId, feed.id));
-  // Bust the article cache when block rules change — see the matching
-  // comment in src/main/index.js's feeds:updateRules handler for why this
-  // matters (otherwise the element picker's verification step checks
-  // stale, pre-rule cached content and always reports a false negative).
-  if (cssSelectors !== undefined || htmlPatterns !== undefined) {
+  // Bust the article cache when anything that changes what content gets
+  // returned for this feed's articles changes: block rules (see the
+  // matching comment in src/main/index.js's feeds:updateRules handler —
+  // otherwise the element picker's verification step checks stale,
+  // pre-rule cached content and always reports a false negative),
+  // preferFeedContent (switches between live-fetching and using the
+  // feed's own RSS content — an already-cached live-fetched result would
+  // otherwise keep being served after turning this on, and vice versa),
+  // and fetchStrategyOrder (changes which paywall-bypass strategy gets
+  // tried first, which can produce a different result for the same URL).
+  if (cssSelectors !== undefined || htmlPatterns !== undefined || preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
     const feedId = req.params.id;
     for (const [cacheUrl, entry] of await articleCache.entries()) {
       if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
@@ -754,6 +790,20 @@ app.post('/api/feeds/:id/fetch', async (req, res) => {
 app.post('/api/article/fetch', async (req, res) => {
   const { url, feedId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
+  // This was previously missing entirely — every other endpoint that
+  // fetches a URL on the server's behalf (resolve, add-feed, the proxy)
+  // checks it, but this one, the single highest-traffic one, didn't.
+  // article.link comes from parsed feed content, not something the user
+  // directly typed — a malicious or compromised feed could set an
+  // article's <link> to an internal address (a cloud metadata endpoint,
+  // an internal service, localhost) and have this server fetch it and
+  // hand the response back as "article content."
+  let hostname;
+  try { hostname = new URL(url).hostname; }
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  const ssrfError = await checkSsrfSafe(hostname);
+  if (ssrfError) return res.status(400).json({ error: ssrfError });
+
   const cacheKey = articleContentCacheKey(url);
 
   // These two are independent reads — previously sequential (ttl, then
@@ -905,12 +955,22 @@ app.get('/api/proxy', async (req, res) => {
 });
 
 function buildProxyShim(base, token, mobile) {
+  // JSON.stringify does NOT escape "</script>" — if it appeared inside
+  // base or token, it would prematurely close this <script> tag when
+  // embedded into the HTML response, breaking out of the script context.
+  // Neither value can realistically contain it today (token is a
+  // server-generated hex string; base's host component comes from a URL
+  // that already passed URL parsing and SSRF checks, which don't permit
+  // that character sequence in a hostname) — this is defense-in-depth
+  // against that invariant ever quietly changing, not a fix for a
+  // currently-reachable injection.
+  const safeJson = (v) => JSON.stringify(v).replace(/<\/script/gi, '<\\/script');
   // Runs before any of the page's own <script> tags. Rewrites same-page
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
-    var BASE=${JSON.stringify(base)};
-    var TOKEN=${JSON.stringify(token || '')};
+    var BASE=${safeJson(base)};
+    var TOKEN=${safeJson(token || '')};
     var MOBILE=${mobile ? 'true' : 'false'};
     function toProxied(u){
       try{

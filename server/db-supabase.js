@@ -23,7 +23,7 @@ const { encrypt, decrypt, hashToken } = require('./crypto-util');
 
 function camelFolder(row) {
   if (!row) return row;
-  return { id: row.id, userId: row.user_id, name: row.name, icon: row.icon, order: row.order };
+  return { id: row.id, userId: row.user_id, name: row.name, icon: row.icon, order: row.order, thumbnailMode: row.thumbnail_mode };
 }
 function camelFeed(row) {
   if (!row) return row;
@@ -34,6 +34,7 @@ function camelFeed(row) {
     titleBlocklist: row.title_blocklist || [], fetchStrategyOrder: row.fetch_strategy_order || [],
     showThumbnail: row.show_thumbnail,
     thumbnailMode: row.thumbnail_mode,
+    preferFeedContent: row.prefer_feed_content,
   };
 }
 function feedToRow(feed) {
@@ -51,6 +52,7 @@ function feedToRow(feed) {
   if ('fetchStrategyOrder' in feed) row.fetch_strategy_order = feed.fetchStrategyOrder;
   if ('showThumbnail' in feed) row.show_thumbnail = feed.showThumbnail;
   if ('thumbnailMode' in feed) row.thumbnail_mode = feed.thumbnailMode;
+  if ('preferFeedContent' in feed) row.prefer_feed_content = feed.preferFeedContent;
   return row;
 }
 function camelUser(row) {
@@ -205,6 +207,7 @@ class SupabaseStore {
     const row = {};
     if (patch.name !== undefined) row.name = patch.name;
     if (patch.icon !== undefined) row.icon = patch.icon;
+    if (patch.thumbnailMode !== undefined) row.thumbnail_mode = patch.thumbnailMode;
     const { data, error } = await this.sb.from('folders').update(row).eq('user_id', userId).eq('id', id).select().maybeSingle();
     this._throw(error, 'updateFolder');
     return camelFolder(data);

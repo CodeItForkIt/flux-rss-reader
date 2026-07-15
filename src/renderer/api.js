@@ -135,6 +135,22 @@ export const auth = {
   getRemoteConfig: () => _remote,
 };
 
+// ── Bootstrap (initial load) ────────────────────────────────────────────────
+// One round trip instead of four separate ones (feeds, folders, article
+// state, settings) for the web/HTTP path, where round-trip count directly
+// drives how long "loading your account" takes. Electron's IPC calls don't
+// have the same per-request network overhead a real HTTP round trip does,
+// and there's no single IPC handler for this combined shape, so that path
+// just runs the four calls in parallel as before.
+export async function bootstrap() {
+  if (usesHttp()) return http('GET', '/api/bootstrap');
+  const [feeds_, folders_, articleState, settings] = await Promise.all([
+    window.flux.feeds.list(), window.flux.folders.list(),
+    window.flux.articles.getState(), window.flux.settings.get(),
+  ]);
+  return { feeds: feeds_, folders: folders_, articleState, settings };
+}
+
 // ── Feeds ─────────────────────────────────────────────────────────────────────
 export const feeds = {
   list:           pick(() => window.flux.feeds.list(),              () => http('GET',    '/api/feeds')),

@@ -203,6 +203,7 @@ class JSONStore {
     if (!folder) return null;
     if (patch.name !== undefined) folder.name = patch.name;
     if (patch.icon !== undefined) folder.icon = patch.icon;
+    if (patch.thumbnailMode !== undefined) folder.thumbnailMode = patch.thumbnailMode;
     this._save();
     return folder;
   }

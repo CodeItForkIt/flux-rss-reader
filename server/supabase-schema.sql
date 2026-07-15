@@ -36,7 +36,8 @@ create table if not exists folders (
   user_id   bigint not null references users(id) on delete cascade,
   name      text not null,
   icon      text default '◈',
-  "order"   integer default 0
+  "order"   integer default 0,
+  thumbnail_mode text
 );
 create index if not exists folders_user_id_idx on folders (user_id);
 
@@ -55,7 +56,8 @@ create table if not exists feeds (
   title_blocklist        jsonb default '[]',
   fetch_strategy_order   jsonb default '[]',
   show_thumbnail         boolean,
-  thumbnail_mode         text
+  thumbnail_mode         text,
+  prefer_feed_content    boolean
 );
 create index if not exists feeds_user_id_idx on feeds (user_id);
 

@@ -2215,13 +2215,14 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
   const [saving,setSaving]=useState(false);
   const [name,setName]=useState(feed?.name||'');
   const [thumbnailMode,setThumbnailMode]=useState(feed?.thumbnailMode||'inherit');
+  const [preferFeedContent,setPreferFeedContent]=useState(!!feed?.preferFeedContent);
   const save=async()=>{
     setSaveError(null);
     const trimmedName = name.trim();
     if (!trimmedName) { setSaveError('Display name can\'t be empty'); return; }
     setSaving(true);
     try {
-      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode, ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
+      await onSave({feedId:feed.id,name:trimmedName,cssSelectors:css.split('\n').map(s=>s.trim()).filter(Boolean),htmlPatterns:html.split('\n').map(s=>s.trim()).filter(Boolean),inlineBrowser:inline,hideShorts,folder:folder||null,titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),fetchStrategyOrder:strategyOverride?strategyOrder:[],thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode,preferFeedContent, ...(editingUrl && url.trim()!==feed?.url ? {url:url.trim()} : {})});
       onClose();
     } catch(e) { setSaveError(e.message || 'Save failed — please try again.'); }
     finally { setSaving(false); }
@@ -2261,6 +2262,14 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
         </select>
       </div>
       <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser for this feed</label>
+      <div>
+        <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={preferFeedContent} onChange={e=>setPreferFeedContent(e.target.checked)} style={{ width:'auto', padding:0 }} />Read articles from this feed's own content, not the linked page</label>
+        <div style={{ fontSize:11, color:T.textMuted, marginTop:4, marginLeft:24 }}>
+          For feeds like Daring Fireball's Linked List, where the article link points at an external
+          site but the feed itself contains the actual writing. Leave off for most feeds — this skips
+          fetching the linked page entirely, so only turn it on for a feed you've confirmed needs it.
+        </div>
+      </div>
       <div>
         <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Lead image in article list</label>
         <select value={thumbnailMode} onChange={e=>setThumbnailMode(e.target.value)} style={{ width:'100%' }}>
