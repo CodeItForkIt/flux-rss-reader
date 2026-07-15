@@ -357,22 +357,28 @@ function extractReadable(html, url) {
 async function fetchArticle(url, feedRules, cookieJars, rssFallback) {
   await loadDeps();
 
-  // Some feeds' <link> doesn't point at "the article" at all — see the
-  // matching comment on rssContent in fetchFeed above for the Daring
-  // Fireball Linked List example (link points at whatever external page is
-  // being linked to; the feed's own content holds the actual commentary).
-  // When the feed itself already supplies substantial content, use it
-  // directly rather than live-fetching and Readability-extracting whatever
-  // <link> happens to point at — for feeds like this, that's both more
-  // correct (shows the feed owner's own writing, not an unrelated external
-  // page) and faster (skips the fetch+extraction pipeline entirely).
-  // "Substantial" uses the same >400-stripped-character threshold applied
-  // when this was captured at feed-fetch time, so a feed that only ever
-  // supplies a short teaser in its RSS still falls through to the normal
-  // live-fetch behavior below, unchanged.
-  if (rssFallback?.content) {
+  // Some feeds' <link> doesn't point at "the article" at all — Daring
+  // Fireball's Linked List format is the motivating example: <link> points
+  // at whatever external page is being linked to, while the feed's own
+  // content holds the actual commentary. For those feeds, using the feed's
+  // own RSS content instead of live-fetching <link> is both more correct
+  // and faster.
+  //
+  // This is explicit per-feed opt-in (feedRules.preferFeedContent), not an
+  // automatic decision based on content length or pattern-matching. That
+  // was tried — twice — and both times it misfired on The Verge, which
+  // deliberately truncates its own feed content into a teaser long enough
+  // to look like "real" full content by any generic size/pattern heuristic.
+  // Guessing which feeds are DF-shaped vs Verge-shaped from content alone
+  // isn't reliable; asking the ~2% of feeds that actually need this to be
+  // configured once is safer than silently truncating every other feed
+  // that happens to write a long RSS summary. looksLikeTeaser is still
+  // checked even when opted in, as a last-resort safety net — an opted-in
+  // feed whose content that specific fetch happens to obviously be a
+  // teaser still falls through to live-fetching rather than showing it.
+  if (feedRules?.preferFeedContent && rssFallback?.content) {
     const strippedContent = stripHtml(rssFallback.content).trim();
-    if (strippedContent.length > 400 && !looksLikeTeaser(strippedContent)) {
+    if (strippedContent.length > 200 && !looksLikeTeaser(strippedContent)) {
       const text = rssFallback.content;
       return {
         title:       rssFallback.title  || '',

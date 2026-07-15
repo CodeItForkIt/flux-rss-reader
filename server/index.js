@@ -562,7 +562,7 @@ app.use('/api/', (req, res, next) => {
 
 // ─── Folders ──────────────────────────────────────────────────────────────────
 app.get('/api/folders', async (req, res) => {
-  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon })));
+  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon, thumbnailMode: f.thumbnailMode || null })));
 });
 app.post('/api/folders', async (req, res) => {
   const { name, icon } = req.body;
@@ -580,8 +580,8 @@ app.put('/api/folders/reorder', async (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/folders/:id', async (req, res) => {
-  const { name, icon } = req.body;
-  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon });
+  const { name, icon, thumbnailMode } = req.body;
+  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon, thumbnailMode });
   if (!folder) return res.status(404).json({ error: 'Not found' });
   res.json(folder);
 });
@@ -602,6 +602,7 @@ const feedRow = (f) => ({
   fetchStrategyOrder: f.fetchStrategyOrder || [],
   showThumbnail: f.showThumbnail === true ? true : f.showThumbnail === false ? false : null, // deprecated, superseded by thumbnailMode below — kept read-only for any already-set rows
   thumbnailMode: f.thumbnailMode || null, // null = inherit global setting; 'large' | 'small' | 'none' = explicit override
+  preferFeedContent: !!f.preferFeedContent,
   autoRefreshEnabled: f.autoRefreshEnabled !== false,
 });
 
@@ -661,7 +662,7 @@ app.post('/api/feeds', async (req, res) => {
   res.json(feedRow(feed));
 });
 app.patch('/api/feeds/:id', async (req, res) => {
-  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail, thumbnailMode } = req.body;
+  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail, thumbnailMode, preferFeedContent } = req.body;
   const patch = {};
   if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
   if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -677,6 +678,7 @@ app.patch('/api/feeds/:id', async (req, res) => {
   // undefined` (missing from the request at all) rather than truthiness.
   if (showThumbnail !== undefined) patch.showThumbnail = showThumbnail;
   if (thumbnailMode !== undefined) patch.thumbnailMode = thumbnailMode;
+  if (preferFeedContent !== undefined) patch.preferFeedContent = !!preferFeedContent;
   if (url !== undefined) {
     let newUrl = url.trim();
     if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
@@ -786,6 +788,33 @@ app.post('/api/article/clear-cache', async (req, res) => {
 
 // ─── Article state ────────────────────────────────────────────────────────────
 app.get('/api/articles/state', async (req, res) => res.json(await db.getArticleState(req.userId)));
+
+// Combined initial-load endpoint — the client used to make four separate
+// requests (feeds, folders, article state, settings) in parallel via
+// Promise.all on mount. Client-side parallelism doesn't remove the cost of
+// four separate round trips: each one pays its own TLS/connection
+// overhead, passes through the auth middleware independently, and on
+// Vercel specifically each can land on a different concurrent lambda
+// invocation with its own cold-start risk. This does the same four reads
+// server-side (still via Promise.all, so no slower than the slowest
+// individual one) but as a single response — one round trip instead of
+// four is the single biggest lever available for "account data takes a
+// couple seconds to load".
+app.get('/api/bootstrap', async (req, res) => {
+  const [feeds, folders, articleState, settings] = await Promise.all([
+    db.listFeeds(req.userId),
+    db.listFolders(req.userId),
+    db.getArticleState(req.userId),
+    getSettingsCached(req.userId),
+  ]);
+  res.json({
+    feeds: feeds.map(feedRow),
+    folders: folders.map(f => ({ id: f.id, name: f.name, icon: f.icon, thumbnailMode: f.thumbnailMode || null })),
+    articleState,
+    settings,
+  });
+});
+
 app.post('/api/articles/mark-read', async (req, res) => {
   const { articleId, feedId, read } = req.body;
   await db.markRead(req.userId, `${feedId}:${articleId}`, read !== false);

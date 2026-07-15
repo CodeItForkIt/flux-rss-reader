@@ -102,7 +102,7 @@ function IconBtn({ icon, onClick, title, active, danger, size=30, disabled }) {
 function Divider({ vertical, margin=8 }) {
   return <div style={vertical ? { width:1, alignSelf:'stretch', background:T.border, margin:`0 ${margin}px`, flexShrink:0 } : { height:1, background:T.borderSubtle, margin:`${margin}px 0` }} />;
 }
-function Modal({ title, children, onClose, wide }) {
+function Modal({ title, children, footer, onClose, wide }) {
   return <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000, padding:20 }} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
     <div style={{ background:T.surface, border:`1px solid ${T.border}`, borderRadius:12, padding:20, width:wide?560:420, maxWidth:'100%', maxHeight:'90vh', display:'flex', flexDirection:'column', boxShadow:'0 20px 60px rgba(0,0,0,0.5)' }} className="fade-in">
       <div style={{ display:'flex', alignItems:'center', marginBottom:16, flexShrink:0 }}>
@@ -113,6 +113,9 @@ function Modal({ title, children, onClose, wide }) {
       <div style={{ overflowY:'auto', flex:1 }}>
         {children}
       </div>
+      {footer && <div style={{ flexShrink:0, marginTop:14, paddingTop:14, borderTop:`1px solid ${T.borderSubtle}` }}>
+        {footer}
+      </div>}
     </div>
   </div>;
 }
@@ -625,7 +628,7 @@ function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedI
       )}
       {displayed.map(item => item.type==='group'
         ? <GroupRow key={`group:${item.clusterId}`} group={item} feeds={feeds} isSelected={selectedId===`group:${item.clusterId}`} onClick={()=>handleSelect({ id:`group:${item.clusterId}`, isGroup:true, clusterId:item.clusterId, members:item.members })} />
-        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} settings={settings} />
+        : <ArticleRow key={item.article.id} article={item.article} feed={feeds.find(f=>f.id===item.article.feedId)} folder={folders.find(fo=>fo.id===feeds.find(f=>f.id===item.article.feedId)?.folder)} isSelected={item.article.id===selectedId} onClick={()=>handleSelect(item.article)} deArrowEnabled={deArrowEnabled} settings={settings} />
       )}
     </div>
   </div>;
@@ -645,7 +648,7 @@ function titleIsBlocked(title, feed, settings) {
   return false;
 }
 
-function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settings }) {
+function ArticleRow({ article, feed, folder, isSelected, onClick, deArrowEnabled, settings }) {
   const [h,setH]=useState(false);
   const isYt=article.isYoutube;
   const dearrow = useDeArrow(isYt ? article.videoId : null, !!deArrowEnabled);
@@ -662,6 +665,15 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // than staying stuck on a stale failure from a since-changed URL.
   const [imgFailed, setImgFailed] = useState(false);
   useEffect(()=>{ setImgFailed(false); },[displayThumb]);
+  // YouTube's hqdefault.jpg fallback (used when fetchFeed has no real
+  // thumbnail from media:thumbnail/enclosure) returns a real image that
+  // loads successfully — HTTP 200, no error event — but is YouTube's own
+  // generic "no thumbnail available yet" gray placeholder graphic when the
+  // video doesn't actually have one. It's reliably exactly 120x90 pixels;
+  // an actual thumbnail is always the full 480x360 (or larger) size. This
+  // is the "still sometimes getting the placeholder" case onError alone
+  // can't catch, since nothing about the request actually failed.
+  const onImgLoad = (e) => { if (e.target.naturalWidth === 120 && e.target.naturalHeight === 90) setImgFailed(true); };
   // Per-feed thumbnailMode overrides the global setting; null/undefined
   // inherits it. Previously this was YouTube-only even though thumbnail
   // extraction itself (see fetchFeed in core/fetcher.js) already pulls
@@ -670,7 +682,11 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // photo-blog feeds do, and they never got a chance to show it. 'large'
   // is the default, matching the only style that existed before this was
   // configurable.
-  const mode = feed?.thumbnailMode || settings?.listThumbnailMode || 'large';
+  // Precedence: feed's own override > the folder it's in > global setting
+  // > 'large' default. A feed's own choice always wins since it's the
+  // most specific; folder is a convenience for setting many feeds at once
+  // without having to open each one individually.
+  const mode = feed?.thumbnailMode || folder?.thumbnailMode || settings?.listThumbnailMode || 'large';
   const showThumb = mode !== 'none' && !!displayThumb && !imgFailed;
 
   const metaRow = <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
@@ -693,7 +709,7 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // tablet) the image could scale up to a genuinely oversized block that
   // dwarfed the actual text content it was supposed to be a preview for.
   const largeThumb = showThumb && <div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} onLoad={onImgLoad} />
     {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:32, height:32, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:12 }}>▶</div></div>}
     {isYt&&deArrowEnabled&&dearrow?.title&&<div style={{ position:'absolute', bottom:0, left:0, right:0, padding:'4px 6px', background:'rgba(0,0,0,.7)', fontSize:11, color:'#fff', fontWeight:600 }}>{dearrow.title}</div>}
   </div>;
@@ -701,7 +717,7 @@ function ArticleRow({ article, feed, isSelected, onClick, deArrowEnabled, settin
   // 'small': a fixed square thumbnail beside the title/meta/summary block,
   // the compact layout style most readers (Reeder, NetNewsWire, etc.) use.
   const smallThumb = showThumb && <div style={{ width:52, height:52, borderRadius:6, overflow:'hidden', background:T.bg, flexShrink:0, position:'relative' }}>
-    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
+    <img src={displayThumb} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} onLoad={onImgLoad} />
     {isYt&&<div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center' }}><div style={{ width:18, height:18, borderRadius:'50%', background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:8 }}>▶</div></div>}
   </div>;
 
@@ -729,10 +745,11 @@ function GroupRow({ group, feeds, isSelected, onClick }) {
   // as an empty placeholder box for any broken/404'd thumbnail URL.
   const [imgFailed, setImgFailed] = useState(false);
   useEffect(()=>{ setImgFailed(false); },[top.thumbnail]);
+  const onImgLoad = (e) => { if (e.target.naturalWidth === 120 && e.target.naturalHeight === 90) setImgFailed(true); };
   const showThumb = isYt && top.thumbnail && !imgFailed;
   return <div onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ padding:'11px 13px', borderBottom:`1px solid ${T.borderSubtle}`, cursor:'pointer', background:isSelected?T.surfaceActive:h?T.surfaceHover:'transparent', borderLeft:`3px solid ${isSelected?T.accent:'transparent'}`, transition:'background 0.1s', position:'relative' }}>
     {showThumb&&<div style={{ width:'100%', maxHeight:140, aspectRatio:'16/9', borderRadius:6, overflow:'hidden', background:T.bg, marginBottom:8, position:'relative' }}>
-      <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} />
+      <img src={top.thumbnail} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }} onError={()=>setImgFailed(true)} onLoad={onImgLoad} />
     </div>}
     <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4, flexWrap:'wrap' }}>
       <Badge tone="ai" tiny>◆ {group.members.length} sources</Badge>
@@ -2209,7 +2226,12 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
     } catch(e) { setSaveError(e.message || 'Save failed — please try again.'); }
     finally { setSaving(false); }
   };
-  return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide>
+  return <Modal title={`Feed settings — ${feed?.name}`} onClose={onClose} wide footer={
+    <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+      {saveError && <div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{saveError}</div>}
+      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}><Btn variant="outline" onClick={onClose}>Cancel</Btn><Btn variant="primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</Btn></div>
+    </div>
+  }>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <div style={{ background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:'10px 14px', fontSize:12, color:T.textMuted, lineHeight:1.6 }}>Rules are applied <strong style={{ color:T.text }}>before</strong> Readability extracts the article.</div>
       <div>
@@ -2289,8 +2311,6 @@ function FeedRulesModal({ feed, folders, onSave, onClose }) {
       </div>
       <div><label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>CSS selectors to remove</label><textarea value={css} onChange={e=>setCss(e.target.value)} placeholder={`.paywall-overlay\n.subscription-modal\n#cookie-banner`} style={{ width:'100%', height:110, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} /></div>
       <div><label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>HTML text patterns (regex)</label><textarea value={html} onChange={e=>setHtml(e.target.value)} placeholder="Subscribe to read more" style={{ width:'100%', height:80, resize:'vertical', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} /></div>
-      {saveError && <div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{saveError}</div>}
-      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}><Btn variant="outline" onClick={onClose}>Cancel</Btn><Btn variant="primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</Btn></div>
     </div>
   </Modal>;
 }
@@ -2402,6 +2422,101 @@ function DailyDigestModal({ articles, settings, onClose }) {
   );
 }
 
+// ─── About / Credits ────────────────────────────────────────────────────────
+const GITHUB_REPO_URL = 'https://github.com/CodeItForkIt/flux-rss-reader';
+
+function AboutModal({ onClose, onOpenCredits }) {
+  return <Modal title="About Flux" onClose={onClose}>
+    <div style={{ display:'flex', flexDirection:'column', gap:14, fontSize:13, lineHeight:1.6, color:T.text }}>
+      <div style={{ fontSize:22, fontWeight:800, color:T.accent, letterSpacing:'-0.02em' }}>Flux</div>
+      <p style={{ margin:0 }}>
+        Flux is a personal RSS/Atom reader. It fetches your subscribed feeds, extracts clean readable
+        article content (stripping ads and clutter via Mozilla's Readability engine), and supports
+        YouTube channels as feeds with SponsorBlock segment-skipping and DeArrow clickbait-title/
+        thumbnail replacement built in. It can optionally use a local Ollama model to cluster related
+        articles from different sources together and generate summaries.
+      </p>
+      <p style={{ margin:0 }}>
+        It runs either as a self-hosted web app (this deployment) or as a desktop app via Electron,
+        with the same account able to move between both.
+      </p>
+      <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+        <Btn variant="primary" onClick={()=>api.openExternal(GITHUB_REPO_URL)}>View source on GitHub</Btn>
+        <Btn variant="outline" onClick={onOpenCredits}>Credits &amp; disclosures</Btn>
+      </div>
+    </div>
+  </Modal>;
+}
+
+function CreditsModal({ onClose }) {
+  const Section = ({ title, children }) => <div>
+    <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:8 }}>{title}</div>
+    {children}
+  </div>;
+  const Lib = ({ name, url, note }) => <div style={{ display:'flex', justifyContent:'space-between', gap:12, padding:'6px 0', borderBottom:`1px solid ${T.borderSubtle}`, fontSize:12.5 }}>
+    <div><a href="#" onClick={e=>{e.preventDefault();api.openExternal(url);}} style={{ color:T.accent }}>{name}</a>{note && <span style={{ color:T.textMuted }}> — {note}</span>}</div>
+  </div>;
+  return <Modal title="Credits" onClose={onClose} wide>
+    <div style={{ display:'flex', flexDirection:'column', gap:18 }}>
+
+      <Section title="Built with AI assistance">
+        <p style={{ margin:0, fontSize:12.5, color:T.textMuted, lineHeight:1.6 }}>
+          A substantial portion of this app's code — including most feature development, bug fixes,
+          and this credits page itself — was written with the help of Claude, Anthropic's AI model,
+          used through Claude.ai. Architecture decisions, review, and final judgment calls were made
+          by the app's maintainer; Claude did not decide independently what to build.
+        </p>
+      </Section>
+
+      <Section title="Hosting & infrastructure">
+        <p style={{ margin:0, fontSize:12.5, color:T.textMuted, lineHeight:1.6, marginBottom:6 }}>
+          This deployment runs on:
+        </p>
+        <Lib name="Vercel" url="https://vercel.com" note="serverless hosting for the web app and API" />
+        <Lib name="Supabase" url="https://supabase.com" note="Postgres database and storage" />
+      </Section>
+
+      <Section title="Core functionality">
+        <Lib name="Mozilla Readability" url="https://github.com/mozilla/readability" note="extracts clean article content from raw web pages" />
+        <Lib name="rss-parser" url="https://github.com/rbren/rss-parser" note="RSS/Atom feed parsing" />
+        <Lib name="cheerio" url="https://github.com/cheeriojs/cheerio" note="server-side HTML parsing for block rules and the article/inline-browser proxy" />
+        <Lib name="jsdom" url="https://github.com/jsdom/jsdom" note="DOM implementation used alongside Readability" />
+        <Lib name="DOMPurify" url="https://github.com/cure53/DOMPurify" note="sanitizes extracted article HTML before display" />
+        <Lib name="SponsorBlock" url="https://sponsor.ajay.app" note="community-sourced sponsor-segment skip data for YouTube videos" />
+        <Lib name="DeArrow" url="https://dearrow.ajay.app" note="community-sourced clickbait title/thumbnail replacements for YouTube videos" />
+      </Section>
+
+      <Section title="Server & app framework">
+        <Lib name="Express" url="https://expressjs.com" note="web server framework" />
+        <Lib name="React" url="https://react.dev" />
+        <Lib name="Vite" url="https://vitejs.dev" note="build tooling" />
+        <Lib name="Electron" url="https://www.electronjs.org" note="desktop app packaging" />
+        <Lib name="Supabase JS client" url="https://github.com/supabase/supabase-js" />
+      </Section>
+
+      <Section title="Security & auth">
+        <Lib name="bcryptjs" url="https://github.com/dcodeIO/bcrypt.js" note="password hashing" />
+        <Lib name="otplib" url="https://github.com/yeojz/otplib" note="two-factor authentication (TOTP)" />
+        <Lib name="qrcode" url="https://github.com/soldair/node-qrcode" note="2FA setup QR codes" />
+        <Lib name="helmet" url="https://github.com/helmetjs/helmet" note="HTTP security headers" />
+        <Lib name="express-rate-limit" url="https://github.com/express-rate-limit/express-rate-limit" />
+        <Lib name="tough-cookie" url="https://github.com/salesforce/tough-cookie" note="cookie jar for per-site login sessions used when fetching articles" />
+      </Section>
+
+      <Section title="Other">
+        <Lib name="node-fetch" url="https://github.com/node-fetch/node-fetch" />
+        <Lib name="cors" url="https://github.com/expressjs/cors" />
+        <Lib name="multer" url="https://github.com/expressjs/multer" note="OPML file upload handling" />
+        <Lib name="Vercel Analytics & Speed Insights" url="https://vercel.com/docs/analytics" />
+      </Section>
+
+      <div style={{ fontSize:11, color:T.textSubtle }}>
+        Full dependency versions are listed in <a href="#" onClick={e=>{e.preventDefault();api.openExternal(GITHUB_REPO_URL+'/blob/main/package.json');}} style={{ color:T.textSubtle }}>package.json</a> in the repository.
+      </div>
+    </div>
+  </Modal>;
+}
+
 function SettingsModal({ settings, onSave, onClose }) {
   const [aiEnabled, setAiEnabled] = useState(settings.aiClusteringEnabled ?? false);
   const [sbEnabled, setSbEnabled] = useState(settings.sponsorBlockEnabled ?? true);
@@ -2417,10 +2532,19 @@ function SettingsModal({ settings, onSave, onClose }) {
   const [clusterSameSource, setClusterSameSource] = useState(!(settings.clusterExcludeSameSource !== false)); // UI shows the positive framing ("group same-source together")
   const [titleBlocklist, setTitleBlocklist] = useState((settings.titleBlocklist || []).join('\n'));
   const [listThumbnailMode, setListThumbnailMode] = useState(settings.listThumbnailMode || 'large');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+  const [showAbout, setShowAbout] = useState(false);
+  const [showCredits, setShowCredits] = useState(false);
 
   const save = async () => {
-    await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), listThumbnailMode });
-    onClose();
+    setSaveError(null);
+    setSaving(true);
+    try {
+      await onSave({ ...settings, aiClusteringEnabled: aiEnabled, sponsorBlockEnabled: sbEnabled, deArrowEnabled, ollamaAutoStart, ollamaUrl: ollamaUrl.trim(), ollamaModel: ollamaModel.trim(), articleCacheDays: Number(cacheDays)||7, refreshIntervalMinutes: Number(refreshInterval)||30, hiddenViews: [...hiddenViews], fetchStrategyOrder: strategyOrder, clusterMaxDaysApart: Number(clusterMaxDaysApart)||3, clusterExcludeSameSource: !clusterSameSource, titleBlocklist: titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean), listThumbnailMode });
+      onClose();
+    } catch(e) { setSaveError(e.message || 'Save failed — please try again.'); }
+    finally { setSaving(false); }
   };
 
   const Toggle = ({ checked, onChange, title, desc }) => (
@@ -2433,7 +2557,18 @@ function SettingsModal({ settings, onSave, onClose }) {
     </label>
   );
 
-  return <Modal title="Settings" onClose={onClose} wide>
+  return <>
+  <Modal title="Settings" onClose={onClose} wide footer={
+    <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+      {saveError && <div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{saveError}</div>}
+      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+        <a href="#" onClick={e=>{e.preventDefault();setShowAbout(true);}} style={{ fontSize:11, color:T.textSubtle }}>About Flux</a>
+        <div style={{ flex:1 }} />
+        <Btn variant="outline" onClick={onClose}>Cancel</Btn>
+        <Btn variant="primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</Btn>
+      </div>
+    </div>
+  }>
     <div style={{ display:'flex', flexDirection:'column', gap:18 }}>
       <div>
         <div style={{ fontSize:11, fontWeight:700, color:T.textSubtle, letterSpacing:'0.06em', textTransform:'uppercase', marginBottom:10 }}>AI features</div>
@@ -2554,13 +2689,11 @@ function SettingsModal({ settings, onSave, onClose }) {
       </div>
 
       {api.isRemoteHttp() && <AccountSection />}
-
-      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
-        <Btn variant="outline" onClick={onClose}>Cancel</Btn>
-        <Btn variant="primary" onClick={save}>Save</Btn>
-      </div>
     </div>
-  </Modal>;
+  </Modal>
+  {showAbout && <AboutModal onClose={()=>setShowAbout(false)} onOpenCredits={()=>{setShowAbout(false);setShowCredits(true);}} />}
+  {showCredits && <CreditsModal onClose={()=>setShowCredits(false)} />}
+  </>;
 }
 
 // Only rendered when the app is talking to a real server with accounts
@@ -2715,13 +2848,25 @@ function NewFolderModal({ onAdd, onClose }) {
 function EditFolderModal({ folder, onSave, onClose }) {
   const [name,setName] = useState(folder.name);
   const [icon,setIcon] = useState(folder.icon||'◈');
+  const [thumbnailMode,setThumbnailMode] = useState(folder.thumbnailMode||'inherit');
   const [error,setError] = useState(null);
+  const [saving,setSaving] = useState(false);
   const submit = async () => {
     if (!name.trim()) return;
-    try { await onSave({ folderId:folder.id, name:name.trim(), icon:icon.trim()||'◈' }); onClose(); }
-    catch(e) { setError(e.message); }
+    setSaving(true);
+    try { await onSave({ folderId:folder.id, name:name.trim(), icon:icon.trim()||'◈', thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode }); onClose(); }
+    catch(e) { setError(e.message || 'Save failed — please try again.'); }
+    finally { setSaving(false); }
   };
-  return <Modal title="Edit folder" onClose={onClose}>
+  return <Modal title="Edit folder" onClose={onClose} footer={
+    <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+      {error&&<div style={{ fontSize:12, color:T.danger }}>{error}</div>}
+      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+        <Btn variant="outline" onClick={onClose}>Cancel</Btn>
+        <Btn variant="primary" onClick={submit} disabled={saving}>{saving?'Saving…':'Save'}</Btn>
+      </div>
+    </div>
+  }>
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
       <div>
         <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Name</label>
@@ -2731,10 +2876,15 @@ function EditFolderModal({ folder, onSave, onClose }) {
         <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Icon</label>
         <FolderIconPicker value={icon} onChange={setIcon} />
       </div>
-      {error&&<div style={{ fontSize:12, color:T.danger }}>{error}</div>}
-      <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
-        <Btn variant="outline" onClick={onClose}>Cancel</Btn>
-        <Btn variant="primary" onClick={submit}>Save</Btn>
+      <div>
+        <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Lead image in article list</label>
+        <select value={thumbnailMode} onChange={e=>setThumbnailMode(e.target.value)} style={{ width:'100%' }}>
+          <option value="inherit">Use global setting</option>
+          <option value="large">Above title, large</option>
+          <option value="small">Beside title, small</option>
+          <option value="none">Not at all</option>
+        </select>
+        <div style={{ fontSize:11, color:T.textMuted, marginTop:4 }}>Applies to feeds in this folder that don't have their own override set.</div>
       </div>
     </div>
   </Modal>;
@@ -3154,7 +3304,7 @@ function MobileLayout({
       <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', paddingBottom:56 }}>
         {visibleArticles.length===0 && <div style={{ padding:40, textAlign:'center', color:T.textSubtle }}>Nothing here.</div>}
         {visibleArticles.map(a => (
-          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} isSelected={false} onClick={()=>goToArticle(a)} settings={settings} />
+          <ArticleRow key={a.id} article={a} feed={feeds_.find(f=>f.id===a.feedId)} folder={folders_.find(fo=>fo.id===feeds_.find(f=>f.id===a.feedId)?.folder)} isSelected={false} onClick={()=>goToArticle(a)} settings={settings} />
         ))}
       </div>
     </div>
@@ -3207,6 +3357,8 @@ function LoginScreen({ onSuccess }) {
   const [signupOpen, setSignupOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [showAbout, setShowAbout] = useState(false);
+  const [showCredits, setShowCredits] = useState(false);
 
   useEffect(() => {
     if (mode !== 'login' && mode !== 'register') return;
@@ -3297,7 +3449,13 @@ function LoginScreen({ onSuccess }) {
           <Btn variant="primary" onClick={submitLogin} disabled={loading || totpCode.trim().length<6}>{loading?<Spinner size={12} color="#fff"/>:null}{loading?'Verifying…':'Verify'}</Btn>
           <div style={{ fontSize:12, color:T.textMuted, textAlign:'center' }}><a href="#" onClick={e=>{e.preventDefault();setMode('login');setTotpCode('');setError(null);}} style={{ color:T.textSubtle }}>Back</a></div>
         </>)}
+
+        <div style={{ marginTop:6, fontSize:11, color:T.textSubtle, textAlign:'center' }}>
+          <a href="#" onClick={e=>{e.preventDefault();setShowAbout(true);}} style={{ color:T.textSubtle }}>About Flux</a>
+        </div>
       </div>
+      {showAbout && <AboutModal onClose={()=>setShowAbout(false)} onOpenCredits={()=>{setShowAbout(false);setShowCredits(true);}} />}
+      {showCredits && <CreditsModal onClose={()=>setShowCredits(false)} />}
     </div>
   );
 }
@@ -3348,6 +3506,14 @@ export default function App() {
   const [feeds_,  setFeeds]    = useState(_cached.feeds || []);
   const [folders_,setFolders]  = useState(_cached.folders || []);
   const [articles,setArticles] = useState(_cached.articles || []);
+  // Only true when there's nothing cached to show immediately — a
+  // first-ever login, a cleared cache, or a new device. Returning users
+  // see their cached feeds/articles instantly (the saveCache mechanism
+  // above) and refreshFeeds updates them in the background same as
+  // always; this flag exists specifically for the case that mechanism
+  // doesn't cover: nothing to paint at all until the first bootstrap()
+  // response comes back.
+  const [bootstrapping, setBootstrapping] = useState(!_cached.feeds);
   const articlesRef = useRef([]); // keeps current articles accessible inside refreshFeeds useCallback
   useEffect(() => { articlesRef.current = articles; }, [articles]);
   const [activeView,setActiveView] = useState('__all');
@@ -3508,14 +3674,16 @@ export default function App() {
 
   useEffect(()=>{
     if (authState !== 'ok') return;
-    Promise.all([api.feeds.list(), api.folders.list(), api.articles.getState(), api.settings.get()])
-      .then(([f,fo,state,s])=>{
+    api.bootstrap()
+      .then(({ feeds: f, folders: fo, articleState: state, settings: s })=>{
         setFeeds(f); setFolders(fo);
         const merged = { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaAutoStart:false, ollamaUrl:'', ollamaModel:'', ...(s||{}) };
         setSettings(merged);
         saveCache({ feeds: f, folders: fo, settings: merged });
+        setBootstrapping(false);
         if(f.length>0) refreshFeeds(f,state,merged);
-      });
+      })
+      .catch((e)=>{ console.error('[flux] bootstrap failed:', e); setBootstrapping(false); });
   },[authState]);
 
   const [newArticleCount, setNewArticleCount] = useState(0);
@@ -3605,9 +3773,9 @@ export default function App() {
     catch (e) { console.warn('Failed to persist folder order:', e); }
   };
 
-  const handleEditFolder = async({ folderId, name, icon })=>{
-    const updated = await api.folders.update({ folderId, name, icon });
-    setFolders(prev=>prev.map(f=>f.id===folderId?{...f,name:updated.name,icon:updated.icon}:f));
+  const handleEditFolder = async({ folderId, name, icon, thumbnailMode })=>{
+    const updated = await api.folders.update({ folderId, name, icon, thumbnailMode });
+    setFolders(prev=>prev.map(f=>f.id===folderId?{...f,name:updated.name,icon:updated.icon,thumbnailMode:updated.thumbnailMode}:f));
   };
 
   const handleAssignFeedFolder = async(feedId, folderId)=>{
@@ -3665,7 +3833,7 @@ export default function App() {
   const handleImportOPML  = async()=>{
     if (api.isElectron) {
       const r=await api.opml.import();
-      if (!r.canceled) { setOpmlResult({mode:'import',result:r}); if(r.imported>0){const [f,fo,state]=await Promise.all([api.feeds.list(),api.folders.list(),api.articles.getState()]);setFeeds(f);setFolders(fo);await refreshFeeds(f,state);} }
+      if (!r.canceled) { setOpmlResult({mode:'import',result:r}); if(r.imported>0){const {feeds:f,folders:fo,articleState:state}=await api.bootstrap();setFeeds(f);setFolders(fo);await refreshFeeds(f,state);} }
     } else { setShowOPMLImport(true); }
   };
 
@@ -3740,6 +3908,17 @@ export default function App() {
       <Spinner size={18}/>
     </div>;
   }
+  if (authState === 'ok' && bootstrapping) {
+    // Only reached on a first-ever load (or cleared cache) — returning
+    // users have _cached data seeded into state already and skip straight
+    // past this, same as before. Distinct from the auth-checking screen
+    // above (different phase, different average duration), but kept
+    // visually identical so there's no jarring flash between the two.
+    return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh', background:T.bg, color:T.textSubtle, fontSize:13 }}>
+      <style>{GLOBAL_CSS}</style>
+      <Spinner size={18}/>
+    </div>;
+  }
   if (authState === 'needed') {
     return <>
       <style>{GLOBAL_CSS}</style>
@@ -3792,7 +3971,7 @@ export default function App() {
     {showAddFeed&&<AddFeedModal folders={folders_} preselectedFolder={typeof showAddFeed==='object'?showAddFeed.id:null} onAdd={handleAddFeed} onClose={()=>setShowAddFeed(null)} />}
     {rulesTarget&&<FeedRulesModal feed={rulesTarget} folders={folders_} onSave={handleSaveRules} onClose={()=>setRulesTarget(null)} />}
     {opmlResult&&<OPMLResultModal mode={opmlResult.mode} result={opmlResult.result} onClose={()=>setOpmlResult(null)} />}
-    {showOPMLImport&&<OPMLImportModal onClose={()=>setShowOPMLImport(false)} onResult={async(r)=>{ setOpmlResult({mode:'import',result:r}); if(r.imported>0){const [f,fo,state]=await Promise.all([api.feeds.list(),api.folders.list(),api.articles.getState()]);setFeeds(f);setFolders(fo);await refreshFeeds(f,state);} }} />}
+    {showOPMLImport&&<OPMLImportModal onClose={()=>setShowOPMLImport(false)} onResult={async(r)=>{ setOpmlResult({mode:'import',result:r}); if(r.imported>0){const {feeds:f,folders:fo,articleState:state}=await api.bootstrap();setFeeds(f);setFolders(fo);await refreshFeeds(f,state);} }} />}
     {showSettings&&<SettingsModal settings={settings} onSave={handleSaveSettings} onClose={()=>setShowSettings(false)} />}
     {showNewFolder&&<NewFolderModal onAdd={handleAddFolder} onClose={()=>setShowNewFolder(false)} />}
     {editFolderTarget&&<EditFolderModal folder={editFolderTarget} onSave={handleEditFolder} onClose={()=>setEditFolderTarget(null)} />}
