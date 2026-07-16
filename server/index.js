@@ -19,6 +19,18 @@
  */
 
 const express  = require('express');
+// Patches Express's router so a thrown/rejected error inside any async
+// route handler is automatically forwarded to the error-handling
+// middleware below, instead of becoming an unhandled rejection that
+// Express 4 silently ignores. Without this, a route like
+// `app.patch('/api/feeds/:id', async (req, res) => { await
+// db.updateFeed(...) /* throws */ })` never sends any response at all —
+// the request just hangs until Vercel's 30-second function maxDuration
+// kills it, which from the client's perspective looks exactly like a
+// button that's stuck ("Saving…" forever) rather than a fast, clear
+// error. Must be required after express and before any routes are
+// defined; it works by monkey-patching express.Router.
+require('express-async-errors');
 const cors     = require('cors');
 const path     = require('path');
 const fs       = require('fs');
@@ -898,7 +910,16 @@ app.post('/api/articles/toggle-star', async (req, res) => {
 //     though the static shell renders fine. Routing it back through our own
 //     server makes it same-origin from the browser's perspective, so CORS
 //     no longer applies at all.
-app.get('/api/proxy', async (req, res) => {
+// app.all (not app.get) — a proxied page's own AJAX calls aren't always
+// GET. The injected shim (buildProxyShim below) rewrites fetch()/XHR URLs
+// to point here but preserves the original method/body/headers entirely,
+// so a page's own POST request (search, filtering, any interactive
+// feature backed by an API call) arrives here as a real POST needing to
+// be forwarded as one — previously this only had a GET route, so any
+// non-GET AJAX call 404'd immediately after being correctly rewritten,
+// which likely explains interactive features silently not working on
+// JS-heavy sites even once the shim itself was functioning correctly.
+app.all('/api/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send('Missing url param');
   let parsed;
@@ -914,7 +935,24 @@ app.get('/api/proxy', async (req, res) => {
     // itself is currently using rather than always forcing a desktop
     // layout into a phone-width frame.
     const useMobileUA = req.query.mobile === '1';
-    const upstream = await fetchWithCookies(target, useMobileUA ? { headers: { 'User-Agent': MOBILE_UA } } : {}, cookieJars);
+    const isBodyMethod = !['GET', 'HEAD'].includes(req.method);
+    // express.json() upstream only parses JSON bodies — a non-JSON POST
+    // (form-encoded, multipart, raw text) would arrive here with
+    // req.body as {} or unparsed, and re-forwarding it correctly isn't
+    // possible without also switching the global body parser to keep raw
+    // bytes for every route. JSON covers the overwhelming majority of
+    // modern API-driven interactive features (search, filters, data
+    // fetches), so this handles that case; other body types pass through
+    // with no body rather than guessing at reconstructing them.
+    const fetchOpts = {
+      headers: useMobileUA ? { 'User-Agent': MOBILE_UA } : {},
+      method: req.method,
+    };
+    if (isBodyMethod && req.body && Object.keys(req.body).length) {
+      fetchOpts.body = JSON.stringify(req.body);
+      fetchOpts.headers = { ...fetchOpts.headers, 'Content-Type': 'application/json' };
+    }
+    const upstream = await fetchWithCookies(target, fetchOpts, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
     if (ct.includes('text/html')) {
       let html = await upstream.text();
@@ -1195,6 +1233,19 @@ app.use((req, res, next) => {
     console.log(`${color}${res.statusCode}\x1b[0m ${req.method} ${req.path} \x1b[2m(${ms}ms)\x1b[0m`);
   });
   next();
+});
+
+// Global error handler — must be registered after every route (Express
+// dispatches to error-handling middleware, identified by its 4-argument
+// signature, only after a route calls next(err) or throws in a way
+// express-async-errors forwards). Every route above returns JSON, so
+// errors should too, rather than Express's default HTML stack-trace page
+// — the client's http() helper in api.js expects to be able to call
+// resp.json() on any response, success or failure.
+app.use((err, req, res, next) => {
+  console.error(`[unhandled] ${req.method} ${req.path}:`, err);
+  if (res.headersSent) return next(err);
+  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

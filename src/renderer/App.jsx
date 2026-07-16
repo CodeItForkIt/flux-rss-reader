@@ -3561,7 +3561,7 @@ export default function App() {
   });
 
 
-  const refreshFeeds = useCallback(async(feedList, state, settingsOverride)=>{
+  const refreshFeeds = useCallback(async(feedList, state, settingsOverride, force=false)=>{
     const cfg = settingsOverride || settings;
     setRefreshing(true);
     const readSet  = new Set(state?.read    || []);
@@ -3618,7 +3618,7 @@ export default function App() {
         });
 
         // Now kick off the stream — results flow back via the event above
-        await api.feeds.fetchStream();
+        await api.feeds.fetchStream(force);
         unsub(); // clean up listener
 
         // Final dedup pass in case of any last stragglers
@@ -3628,7 +3628,7 @@ export default function App() {
 
       } else {
         // ── Batch path (web server) ───────────────────────────────────────
-        const results = await api.feeds.fetchAll();
+        const results = await api.feeds.fetchAll(force);
 
         const faviconUpdates = results.filter(r => r.ok && r.favicon);
         if (faviconUpdates.length) {
@@ -3700,7 +3700,7 @@ export default function App() {
   const handleRefreshAll = async()=>{
     setNewArticleCount(0);
     const state=await api.articles.getState();
-    refreshFeeds(feeds_,state);
+    refreshFeeds(feeds_,state,undefined,true);
   };
 
   // Auto-refresh: poll for new articles at the configured interval.
@@ -3723,7 +3723,7 @@ export default function App() {
       // simultaneously changed in feed contents.
       const prevIds = new Set(articlesRef.current.map(a=>a.id));
       const state = await api.articles.getState();
-      await refreshFeeds(feeds_, state);
+      await refreshFeeds(feeds_, state, undefined, true);
       setArticles(curr => {
         const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
         if (newCount > 0) setNewArticleCount(n => n + newCount);
