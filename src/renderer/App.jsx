@@ -320,11 +320,12 @@ function Sidebar({ folders, feeds, articles, activeView, onSelectView, onOpenAdd
   const baseFilteredArticles = useMemo(() => {
     return articles.filter(a => {
       const feed = feeds.find(f => f.id === a.feedId);
-      if (feed?.hideShorts && a.isShort) return false;
-      if (titleIsBlocked(a.title, feed, settings)) return false;
+      const folder = folders.find(fo => fo.id === feed?.folder);
+      if (effectiveHideShorts(feed, folder) && a.isShort) return false;
+      if (titleIsBlocked(a.title, feed, settings, folder)) return false;
       return true;
     });
-  }, [articles, feeds, settings]);
+  }, [articles, feeds, folders, settings]);
   const unreadInFolder = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&(fid==='__all'||feeds.find(f=>f.id===a.feedId)?.folder===fid)).length;
   const unreadInFeed   = (fid) => baseFilteredArticles.filter(a=>!a.isRead&&a.feedId===fid).length;
 
@@ -640,12 +641,18 @@ function ArticleList({ articles, activeView, feeds, folders, onSelect, selectedI
 // in three separate near-identical inline try/catch loops; centralizing it
 // here means the global list only has to be threaded into one place per
 // call site instead of duplicating the same regex loop a fourth time.
-function titleIsBlocked(title, feed, settings) {
-  const patterns = [...(settings?.titleBlocklist || []), ...(feed?.titleBlocklist || [])];
+function titleIsBlocked(title, feed, settings, folder) {
+  const patterns = [...(settings?.titleBlocklist || []), ...(folder?.titleBlocklist || []), ...(feed?.titleBlocklist || [])];
   for (const pattern of patterns) {
     try { if (new RegExp(pattern, 'i').test(title)) return true; } catch {}
   }
   return false;
+}
+// Feed's own value wins if explicitly set; otherwise falls back to the
+// folder it's in, then false. Same precedence as thumbnailMode elsewhere.
+function effectiveHideShorts(feed, folder) {
+  if (feed?.hideShorts === true || feed?.hideShorts === false) return feed.hideShorts;
+  return !!folder?.hideShorts;
 }
 
 function ArticleRow({ article, feed, folder, isSelected, onClick, deArrowEnabled, settings }) {
@@ -1435,7 +1442,16 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     // making the element picker look like it silently did nothing every
     // single time (you can only reach the picker after already having
     // viewed — and thus cached — the article you're picking from).
-    await onSaveRule(updated);
+    // Also wrapped in try/catch now — previously a rejected save here (a
+    // slow/failed request) was an unhandled promise rejection: the picker
+    // stayed open with no feedback at all rather than telling the user
+    // anything went wrong.
+    try {
+      await onSaveRule(updated);
+    } catch (e) {
+      setError(`Couldn't save that rule: ${e.message}`);
+      return;
+    }
     setPickMode(false);
     setRuleWarning(null);
     // Re-fetch content with new rules
@@ -2858,25 +2874,49 @@ function EditFolderModal({ folder, onSave, onClose }) {
   const [name,setName] = useState(folder.name);
   const [icon,setIcon] = useState(folder.icon||'◈');
   const [thumbnailMode,setThumbnailMode] = useState(folder.thumbnailMode||'inherit');
+  // These, plus thumbnailMode above, are folder-level *defaults* — same
+  // precedence as thumbnailMode: a feed's own setting always wins over
+  // the folder's, so this only affects feeds in the folder that haven't
+  // set their own override. Deliberately excludes anything feed-identity
+  // or site-specific (name, URL, CSS/HTML block-rule selectors, favicon)
+  // — those don't make sense shared across unrelated sites just because
+  // they're filed in the same folder.
+  const [inline,setInline] = useState(folder.inlineBrowser||false);
+  const [hideShorts,setHideShorts] = useState(folder.hideShorts||false);
+  const [titleBlocklist,setTitleBlocklist] = useState((folder.titleBlocklist||[]).join('\n'));
+  const [preferFeedContent,setPreferFeedContent] = useState(!!folder.preferFeedContent);
   const [error,setError] = useState(null);
   const [saving,setSaving] = useState(false);
   const submit = async () => {
     if (!name.trim()) return;
     setSaving(true);
-    try { await onSave({ folderId:folder.id, name:name.trim(), icon:icon.trim()||'◈', thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode }); onClose(); }
+    try {
+      await onSave({
+        folderId:folder.id, name:name.trim(), icon:icon.trim()||'◈',
+        thumbnailMode: thumbnailMode==='inherit'?null:thumbnailMode,
+        inlineBrowser:inline, hideShorts,
+        titleBlocklist:titleBlocklist.split('\n').map(s=>s.trim()).filter(Boolean),
+        preferFeedContent,
+      });
+      onClose();
+    }
     catch(e) { setError(e.message || 'Save failed — please try again.'); }
     finally { setSaving(false); }
   };
-  return <Modal title="Edit folder" onClose={onClose} footer={
+  return <Modal title="Edit folder" onClose={onClose} wide footer={
     <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-      {error&&<div style={{ fontSize:12, color:T.danger }}>{error}</div>}
+      {error&&<div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{error}</div>}
       <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
         <Btn variant="outline" onClick={onClose}>Cancel</Btn>
         <Btn variant="primary" onClick={submit} disabled={saving}>{saving?'Saving…':'Save'}</Btn>
       </div>
     </div>
   }>
-    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+    <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+      <div style={{ background:T.surfaceActive, border:`1px solid ${T.border}`, borderRadius:8, padding:'10px 14px', fontSize:12, color:T.textMuted, lineHeight:1.6 }}>
+        The settings below are <strong style={{ color:T.text }}>defaults for every feed in this folder</strong> — any feed
+        that sets its own value for the same setting keeps its own value instead.
+      </div>
       <div>
         <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Name</label>
         <input autoFocus value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&submit()} style={{ width:'100%' }} />
@@ -2884,6 +2924,17 @@ function EditFolderModal({ folder, onSave, onClose }) {
       <div>
         <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Icon</label>
         <FolderIconPicker value={icon} onChange={setIcon} />
+      </div>
+      <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser for feeds in this folder</label>
+      <div>
+        <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={preferFeedContent} onChange={e=>setPreferFeedContent(e.target.checked)} style={{ width:'auto', padding:0 }} />Read articles from each feed's own content, not the linked page</label>
+        <div style={{ fontSize:11, color:T.textMuted, marginTop:4, marginLeft:24 }}>Same as the per-feed option — useful for folders of feeds (e.g. linkblogs) where this is usually what you want.</div>
+      </div>
+      <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={hideShorts} onChange={e=>setHideShorts(e.target.checked)} style={{ width:'auto', padding:0 }} />Hide Shorts for YouTube feeds in this folder</label>
+      <div>
+        <label style={{ fontSize:12, fontWeight:600, color:T.text, display:'block', marginBottom:6 }}>Title blocklist for this folder</label>
+        <textarea value={titleBlocklist} onChange={e=>setTitleBlocklist(e.target.value)} placeholder="One regex pattern per line" rows={3} style={{ width:'100%', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }} />
+        <div style={{ fontSize:11, color:T.textMuted, marginTop:4 }}>Combines with the global blocklist and each feed's own — any match hides the article.</div>
       </div>
       <div>
         <label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Lead image in article list</label>
@@ -2893,7 +2944,6 @@ function EditFolderModal({ folder, onSave, onClose }) {
           <option value="small">Beside title, small</option>
           <option value="none">Not at all</option>
         </select>
-        <div style={{ fontSize:11, color:T.textMuted, marginTop:4 }}>Applies to feeds in this folder that don't have their own override set.</div>
       </div>
     </div>
   </Modal>;
@@ -3471,6 +3521,21 @@ function LoginScreen({ onSuccess }) {
 
 export default function App() {
   const isMobile = useIsMobile();
+  // Global safety net for exactly the kind of failure this app has had
+  // trouble diagnosing before: a save/fetch that rejects inside a React
+  // event handler (an unguarded `await onSaveRule(...)`, for instance) has
+  // no React error boundary to catch it — it becomes an unhandled promise
+  // rejection that only ever showed up in the browser devtools console,
+  // invisible to both the user and to anyone looking at server-side logs
+  // afterward. This reports it to /api/client-error (see api.js) instead,
+  // without changing the browser's own console behavior.
+  useEffect(() => {
+    const onError = (e) => api.reportClientError(e.message, e.error?.stack, window.location?.pathname);
+    const onRejection = (e) => api.reportClientError(e.reason?.message || String(e.reason), e.reason?.stack, window.location?.pathname);
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => { window.removeEventListener('error', onError); window.removeEventListener('unhandledrejection', onRejection); };
+  }, []);
   // 'checking' (verifying a stored token / Electron's local-vs-remote mode),
   // 'needed' (show the login screen), 'ok' (render the real app). Electron
   // in local IPC mode never has accounts at all, so it goes straight to 'ok'.
@@ -3782,9 +3847,10 @@ export default function App() {
     catch (e) { console.warn('Failed to persist folder order:', e); }
   };
 
-  const handleEditFolder = async({ folderId, name, icon, thumbnailMode })=>{
-    const updated = await api.folders.update({ folderId, name, icon, thumbnailMode });
-    setFolders(prev=>prev.map(f=>f.id===folderId?{...f,name:updated.name,icon:updated.icon,thumbnailMode:updated.thumbnailMode}:f));
+  const handleEditFolder = async(patch)=>{
+    const { folderId } = patch;
+    const updated = await api.folders.update(patch);
+    setFolders(prev=>prev.map(f=>f.id===folderId?{...f,...updated}:f));
   };
 
   const handleAssignFeedFolder = async(feedId, folderId)=>{
@@ -3860,8 +3926,9 @@ export default function App() {
     // represent "never show me this" rather than a temporary view toggle.
     result = result.filter(a=>{
       const feed = feeds_.find(f=>f.id===a.feedId);
-      if (feed?.hideShorts && a.isShort) return false;
-      if (titleIsBlocked(a.title, feed, settings)) return false;
+      const folder = folders_.find(fo=>fo.id===feed?.folder);
+      if (effectiveHideShorts(feed, folder) && a.isShort) return false;
+      if (titleIsBlocked(a.title, feed, settings, folder)) return false;
       return true;
     });
 
@@ -3876,15 +3943,16 @@ export default function App() {
     }
 
     return result;
-  },[articles,activeView,feeds_,filters,settings.aiClusteringEnabled]);
+  },[articles,activeView,feeds_,folders_,filters,settings.aiClusteringEnabled]);
 
   // Base-filtered for counts (no view/status filter, just content filters)
   const baseFilteredArticles = useMemo(()=>articles.filter(a=>{
     const feed=feeds_.find(f=>f.id===a.feedId);
-    if (feed?.hideShorts&&a.isShort) return false;
-    if (titleIsBlocked(a.title, feed, settings)) return false;
+    const folder=folders_.find(fo=>fo.id===feed?.folder);
+    if (effectiveHideShorts(feed, folder)&&a.isShort) return false;
+    if (titleIsBlocked(a.title, feed, settings, folder)) return false;
     return true;
-  }),[articles,feeds_,settings]);
+  }),[articles,feeds_,folders_,settings]);
 
   // Marks only the articles currently visible (respecting whatever
   // folder/feed/filter view is active) as read — not every article in the

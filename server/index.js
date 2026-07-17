@@ -198,9 +198,12 @@ async function articleTtlMs(userId) {
 (async () => {
   try {
     const startupTtl = await articleTtlMs();
-    for (const [url, entry] of await articleCache.entries()) {
-      if (Date.now() - entry.ts > startupTtl) await articleCache.delete(url);
-    }
+    // A single bounded DELETE ... WHERE ts < cutoff, instead of the
+    // previous pattern of pulling every cache row's full content
+    // (articleCache.entries()) into JS just to compare a timestamp — see
+    // the long comment on SupabaseStore.cacheDeleteByFeedId for the
+    // production timeout this caused.
+    await db.cachePruneExpired(Date.now() - startupTtl);
   } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
 })();
 
@@ -597,19 +600,72 @@ app.put('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
 
 // Every route below this line requires a valid device session token.
 app.use('/api/', (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path === '/health') return next();
+  if (req.path.startsWith('/auth/') || req.path === '/health' || req.path === '/client-error') return next();
   if (req.path === '/proxy' && (proxyBypassAllowed(req) || getSessionToken(req))) return next();
   requireAuth(req, res, next);
 });
 
+// Client-side error reports (window.onerror/unhandledrejection, and a few
+// explicit catch blocks — see src/renderer/App.jsx's reportClientError).
+// Deliberately not behind requireAuth: an error can happen before login
+// (e.g. the login screen itself failing to load), and losing visibility
+// into exactly those errors would defeat the point. Still attaches a
+// userId when a valid session token is present, for correlation.
+app.post('/api/client-error', async (req, res) => {
+  let userId = null;
+  try { const session = await db.findSession(getSessionToken(req)); userId = session?.userId ?? null; } catch {}
+  const { message, stack, path, context } = req.body || {};
+  await db.logError({ source: 'client', userId, path, message, stack, context }).catch(() => {});
+  res.json({ ok: true });
+});
+
 // ─── Folders ──────────────────────────────────────────────────────────────────
+// Folder-level fields other than thumbnailMode act purely as a fallback
+// default for feeds that don't set their own override — same precedence
+// as thumbnailMode: feed's own value > folder's > global setting > code
+// default. See resolveFeedRules below, used everywhere a feed's effective
+// settings are needed (article fetch, feed fetch, block-rule filtering).
+function folderRow(f) {
+  return {
+    id: f.id, name: f.name, icon: f.icon,
+    thumbnailMode: f.thumbnailMode || null,
+    hideShorts: f.hideShorts === true ? true : f.hideShorts === false ? false : null,
+    inlineBrowser: f.inlineBrowser === true ? true : f.inlineBrowser === false ? false : null,
+    titleBlocklist: f.titleBlocklist || [],
+    preferFeedContent: f.preferFeedContent === true ? true : f.preferFeedContent === false ? false : null,
+    fetchStrategyOrder: f.fetchStrategyOrder || [],
+  };
+}
+// Merges a feed's own rules with its folder's defaults and (for the two
+// fields that already had one) the global setting — feed wins if it set
+// an explicit value, else the folder's, else global, else the hardcoded
+// default. Boolean fields use the tri-state undefined/null-vs-false
+// convention already established for thumbnailMode/showThumbnail
+// elsewhere in this file: `null` means "not set here, fall through."
+function resolveFeedRules(feedRowData, folder, settings) {
+  if (!feedRowData) return feedRowData;
+  const f = folder ? folderRow(folder) : null;
+  const pick = (feedVal, folderVal, globalVal, fallback) =>
+    (feedVal !== null && feedVal !== undefined && feedVal !== '' && !(Array.isArray(feedVal) && feedVal.length === 0)) ? feedVal
+    : (folderVal !== null && folderVal !== undefined && folderVal !== '' && !(Array.isArray(folderVal) && folderVal.length === 0)) ? folderVal
+    : (globalVal !== null && globalVal !== undefined) ? globalVal
+    : fallback;
+  return {
+    ...feedRowData,
+    hideShorts: pick(feedRowData.hideShorts, f?.hideShorts, null, false),
+    inlineBrowser: pick(feedRowData.inlineBrowser, f?.inlineBrowser, null, false),
+    titleBlocklist: [...(feedRowData.titleBlocklist || []), ...(f?.titleBlocklist || [])],
+    preferFeedContent: pick(feedRowData.preferFeedContent, f?.preferFeedContent, null, false),
+    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder?.length ? feedRowData.fetchStrategyOrder : null, f?.fetchStrategyOrder?.length ? f.fetchStrategyOrder : null, settings?.fetchStrategyOrder?.length ? settings.fetchStrategyOrder : null, []),
+  };
+}
 app.get('/api/folders', async (req, res) => {
-  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon, thumbnailMode: f.thumbnailMode || null })));
+  res.json((await db.listFolders(req.userId)).map(folderRow));
 });
 app.post('/api/folders', async (req, res) => {
   const { name, icon } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
-  res.json(await db.addFolder(req.userId, name, icon || '◈'));
+  res.json(folderRow(await db.addFolder(req.userId, name, icon || '◈')));
 });
 app.delete('/api/folders/:id', async (req, res) => {
   await db.removeFolder(req.userId, req.params.id);
@@ -622,10 +678,26 @@ app.put('/api/folders/reorder', async (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/folders/:id', async (req, res) => {
-  const { name, icon, thumbnailMode } = req.body;
-  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon, thumbnailMode });
+  const { name, icon, thumbnailMode, hideShorts, inlineBrowser, titleBlocklist, preferFeedContent, fetchStrategyOrder } = req.body;
+  const patch = { name, icon, thumbnailMode };
+  if (hideShorts !== undefined) patch.hideShorts = hideShorts;
+  if (inlineBrowser !== undefined) patch.inlineBrowser = inlineBrowser;
+  if (titleBlocklist !== undefined) patch.titleBlocklist = titleBlocklist;
+  if (preferFeedContent !== undefined) patch.preferFeedContent = preferFeedContent;
+  if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
+  const folder = await db.updateFolder(req.userId, req.params.id, patch);
   if (!folder) return res.status(404).json({ error: 'Not found' });
-  res.json(folder);
+  // Same reasoning as the feed-rules PATCH route: preferFeedContent and
+  // fetchStrategyOrder change what content gets returned for an article,
+  // so any feed in this folder that inherits the folder's value (i.e.
+  // doesn't have its own override) needs its cached content invalidated.
+  // A single filtered delete per feed — see cacheDeleteByFeedId's comment
+  // for why this must never fall back to a full-table scan.
+  if (preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
+    const feedsInFolder = (await db.listFeeds(req.userId)).filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length);
+    await Promise.all(feedsInFolder.map(f => db.cacheDeleteByFeedId(f.id)));
+  }
+  res.json(folderRow(folder));
 });
 
 // ─── Feeds ────────────────────────────────────────────────────────────────────
@@ -758,10 +830,12 @@ app.patch('/api/feeds/:id', async (req, res) => {
   // and fetchStrategyOrder (changes which paywall-bypass strategy gets
   // tried first, which can produce a different result for the same URL).
   if (cssSelectors !== undefined || htmlPatterns !== undefined || preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
-    const feedId = req.params.id;
-    for (const [cacheUrl, entry] of await articleCache.entries()) {
-      if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
-    }
+    // Single filtered DELETE (WHERE feed_id = ...) instead of pulling
+    // every cached article's full content over the wire just to filter by
+    // feedId in JS — see the comment on cacheDeleteByFeedId for the
+    // production timeout (and the slow/"crashed-feeling" feed-settings
+    // save) this previously caused.
+    await db.cacheDeleteByFeedId(req.params.id);
   }
   res.json(feedRow(feed));
 });
@@ -778,7 +852,9 @@ app.delete('/api/feeds/:id', async (req, res) => {
 // every single feed's XML from its origin again.
 app.post('/api/feeds/fetch-all', async (req, res) => {
   const force = !!req.body?.force;
-  const feeds = (await db.listFeeds(req.userId)).map(feedRow);
+  const [feedsRaw, folders] = await Promise.all([db.listFeeds(req.userId), db.listFolders(req.userId)]);
+  const folderById = Object.fromEntries(folders.map(f => [f.id, f]));
+  const feeds = feedsRaw.map(f => resolveFeedRules(feedRow(f), f.folder ? folderById[f.folder] : null, null));
   const CONCURRENCY = 6;
   const results = new Array(feeds.length);
   let next = 0;
@@ -794,7 +870,8 @@ app.post('/api/feeds/fetch-all', async (req, res) => {
 app.post('/api/feeds/:id/fetch', async (req, res) => {
   const feed = await db.findFeed(req.userId, req.params.id);
   if (!feed) return res.status(404).json({ error: 'Not found' });
-  try { res.json({ ok: true, ...await fetchFeedCached(req.userId, feedRow(feed), cookieJars, !!req.body?.force) }); }
+  const folder = feed.folder ? await db.findFolder(req.userId, feed.folder) : null;
+  try { res.json({ ok: true, ...await fetchFeedCached(req.userId, resolveFeedRules(feedRow(feed), folder, null), cookieJars, !!req.body?.force) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
@@ -826,11 +903,8 @@ app.post('/api/article/fetch', async (req, res) => {
   if (cached && Date.now() - cached.ts < ttl) return res.json(cached.result);
 
   const feed = feedId ? await db.findFeed(req.userId, feedId) : null;
-  const feedRowData = feed ? feedRow(feed) : null;
-  if (feedRowData && !feedRowData.fetchStrategyOrder?.length) {
-    const globalOrder = (await getSettingsCached(req.userId)).fetchStrategyOrder;
-    if (globalOrder?.length) feedRowData.fetchStrategyOrder = globalOrder;
-  }
+  const folder = feed?.folder ? await db.findFolder(req.userId, feed.folder) : null;
+  const feedRowData = feed ? resolveFeedRules(feedRow(feed), folder, await getSettingsCached(req.userId)) : null;
   try {
     const result = await fetchArticle(url, feedRowData, cookieJars, rssFallback);
     await articleCache.set(cacheKey, { ts: Date.now(), feedId: feedId || null, result });
@@ -1244,6 +1318,8 @@ app.use((req, res, next) => {
 // resp.json() on any response, success or failure.
 app.use((err, req, res, next) => {
   console.error(`[unhandled] ${req.method} ${req.path}:`, err);
+  db.logError({ source: 'server', userId: req.userId, path: `${req.method} ${req.path}`, message: err.message, stack: err.stack })
+    .catch(() => {}); // logError already swallows its own errors; belt-and-suspenders
   if (res.headersSent) return next(err);
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });

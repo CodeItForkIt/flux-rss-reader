@@ -23,7 +23,13 @@ const { encrypt, decrypt, hashToken } = require('./crypto-util');
 
 function camelFolder(row) {
   if (!row) return row;
-  return { id: row.id, userId: row.user_id, name: row.name, icon: row.icon, order: row.order, thumbnailMode: row.thumbnail_mode };
+  return {
+    id: row.id, userId: row.user_id, name: row.name, icon: row.icon, order: row.order,
+    thumbnailMode: row.thumbnail_mode,
+    hideShorts: row.hide_shorts, inlineBrowser: row.inline_browser,
+    titleBlocklist: row.title_blocklist || [], preferFeedContent: row.prefer_feed_content,
+    fetchStrategyOrder: row.fetch_strategy_order || [],
+  };
 }
 function camelFeed(row) {
   if (!row) return row;
@@ -193,6 +199,12 @@ class SupabaseStore {
     this._throw(error, 'addFolder');
     return camelFolder(data);
   }
+  async findFolder(userId, id) {
+    if (!id) return null;
+    const { data, error } = await this.sb.from('folders').select('*').eq('user_id', userId).eq('id', id).maybeSingle();
+    this._throw(error, 'findFolder');
+    return camelFolder(data);
+  }
   async folderExistsByName(userId, name) {
     const { data, error } = await this.sb.from('folders').select('id').eq('user_id', userId).eq('name', name).maybeSingle();
     this._throw(error, 'folderExistsByName');
@@ -208,6 +220,11 @@ class SupabaseStore {
     if (patch.name !== undefined) row.name = patch.name;
     if (patch.icon !== undefined) row.icon = patch.icon;
     if (patch.thumbnailMode !== undefined) row.thumbnail_mode = patch.thumbnailMode;
+    if (patch.hideShorts !== undefined) row.hide_shorts = patch.hideShorts;
+    if (patch.inlineBrowser !== undefined) row.inline_browser = patch.inlineBrowser;
+    if (patch.titleBlocklist !== undefined) row.title_blocklist = patch.titleBlocklist;
+    if (patch.preferFeedContent !== undefined) row.prefer_feed_content = patch.preferFeedContent;
+    if (patch.fetchStrategyOrder !== undefined) row.fetch_strategy_order = patch.fetchStrategyOrder;
     const { data, error } = await this.sb.from('folders').update(row).eq('user_id', userId).eq('id', id).select().maybeSingle();
     this._throw(error, 'updateFolder');
     return camelFolder(data);
@@ -312,6 +329,51 @@ class SupabaseStore {
     const { data, error } = await this.sb.from('article_cache').select('*');
     this._throw(error, 'cacheEntries');
     return (data || []).map(row => [row.url, { ts: row.ts, feedId: row.feed_id, result: row.result }]);
+  }
+  // Deletes cache rows for one feed directly in SQL (WHERE feed_id = ...),
+  // instead of the previous pattern used at both call sites (startup prune
+  // and the feed-rules PATCH route): pulling every row's full `result`
+  // jsonb blob over the wire via cacheEntries() just to find the ones
+  // matching one feedId in JS, then deleting them one HTTP round-trip at a
+  // time. With article_cache holding a couple hundred rows averaging ~10KB
+  // (one observed as large as 771KB) that full-table pull was measured at
+  // ~12MB, and was the direct cause of a logged
+  // "canceling statement due to statement timeout" error that took down
+  // an entire /api/feeds/fetch-all request with a 504 — and, on the
+  // feed-rules save path, is why saving a feed's block rules (cssSelectors/
+  // htmlPatterns — exactly what the element picker writes) felt like it
+  // hung or crashed: the request was still alive, just very slow, because
+  // it was shipping ~12MB of other users'/feeds' cached article content
+  // back and forth before it could even start filtering.
+  async cacheDeleteByFeedId(feedId) {
+    const { error } = await this.sb.from('article_cache').delete().eq('feed_id', feedId);
+    this._throw(error, 'cacheDeleteByFeedId');
+  }
+  // Deletes expired cache rows directly in SQL (WHERE ts < cutoff), instead
+  // of the startup prune's previous pattern of pulling every row (see
+  // cacheDeleteByFeedId's comment) just to compare timestamps in JS.
+  async cachePruneExpired(cutoffTs) {
+    const { error } = await this.sb.from('article_cache').delete().lt('ts', cutoffTs);
+    this._throw(error, 'cachePruneExpired');
+  }
+
+  // ─── Error log ───────────────────────────────────────────────────────────
+  // Deliberately swallows its own errors (logging must never be the thing
+  // that breaks the request it's trying to describe) and never throws via
+  // _throw — a failure here is reported to the console only.
+  async logError({ source, userId, path, message, stack, context }) {
+    try {
+      await this.sb.from('error_logs').insert({
+        source, user_id: userId ?? null, path: path || null,
+        message: (message || '').slice(0, 2000), stack: (stack || '').slice(0, 8000),
+        context: context || null,
+      });
+      // Lazy prune instead of a cron job — cheap (indexed on created_at)
+      // and only runs on the occasional write, not on every read.
+      if (Math.random() < 0.05) {
+        await this.sb.from('error_logs').delete().lt('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+      }
+    } catch (e) { console.error('[error-log] failed to persist:', e.message); }
   }
 }
 

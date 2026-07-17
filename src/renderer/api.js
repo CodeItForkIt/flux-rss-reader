@@ -64,6 +64,23 @@ async function http(method, path, body, isFormData = false) {
   return ct.includes('application/json') ? resp.json() : resp.text();
 }
 
+// ── Error reporting ─────────────────────────────────────────────────────────
+// Best-effort, fire-and-forget — reporting an error must never itself throw
+// or surface anything to the user. No-ops in Electron's local (IPC) mode,
+// since there's no server on the other end to receive it there; the
+// console (already visible in Electron's devtools) is the log in that case.
+export function reportClientError(message, stack, path, context) {
+  try {
+    if (!usesHttp()) { console.error('[flux]', message, stack); return; }
+    const token = authToken();
+    fetch(httpBase() + '/api/client-error', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ message: String(message || ''), stack: String(stack || ''), path, context }),
+    }).catch(() => {});
+  } catch {}
+}
+
 function pick(ipcFn, httpFn) {
   return (...args) => (usesHttp() ? httpFn(...args) : ipcFn(...args));
 }

@@ -403,7 +403,12 @@ app.use('/api/', (req, res, next) => {
 
 // ─── Folders ──────────────────────────────────────────────────────────────────
 app.get('/api/folders', async (req, res) => {
-  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon })));
+  res.json((await db.listFolders(req.userId)).map(f => ({
+    id: f.id, name: f.name, icon: f.icon, thumbnailMode: f.thumbnailMode || null,
+    hideShorts: f.hideShorts ?? null, inlineBrowser: f.inlineBrowser ?? null,
+    titleBlocklist: f.titleBlocklist || [], preferFeedContent: f.preferFeedContent ?? null,
+    fetchStrategyOrder: f.fetchStrategyOrder || [],
+  })));
 });
 app.post('/api/folders', async (req, res) => {
   const { name, icon } = req.body;
@@ -421,8 +426,14 @@ app.put('/api/folders/reorder', async (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/folders/:id', async (req, res) => {
-  const { name, icon } = req.body;
-  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon });
+  const { name, icon, thumbnailMode, hideShorts, inlineBrowser, titleBlocklist, preferFeedContent, fetchStrategyOrder } = req.body;
+  const patch = { name, icon, thumbnailMode };
+  if (hideShorts !== undefined) patch.hideShorts = hideShorts;
+  if (inlineBrowser !== undefined) patch.inlineBrowser = inlineBrowser;
+  if (titleBlocklist !== undefined) patch.titleBlocklist = titleBlocklist;
+  if (preferFeedContent !== undefined) patch.preferFeedContent = preferFeedContent;
+  if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
+  const folder = await db.updateFolder(req.userId, req.params.id, patch);
   if (!folder) return res.status(404).json({ error: 'Not found' });
   res.json(folder);
 });

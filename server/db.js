@@ -187,6 +187,10 @@ class JSONStore {
     this._save();
     return folder;
   }
+  findFolder(userId, id) {
+    if (!id) return null;
+    return this.data.folders.find(f => f.userId === userId && f.id === id) || null;
+  }
   folderExistsByName(userId, name) {
     return this.data.folders.find(f => f.userId === userId && f.name === name);
   }
@@ -204,6 +208,11 @@ class JSONStore {
     if (patch.name !== undefined) folder.name = patch.name;
     if (patch.icon !== undefined) folder.icon = patch.icon;
     if (patch.thumbnailMode !== undefined) folder.thumbnailMode = patch.thumbnailMode;
+    if (patch.hideShorts !== undefined) folder.hideShorts = patch.hideShorts;
+    if (patch.inlineBrowser !== undefined) folder.inlineBrowser = patch.inlineBrowser;
+    if (patch.titleBlocklist !== undefined) folder.titleBlocklist = patch.titleBlocklist;
+    if (patch.preferFeedContent !== undefined) folder.preferFeedContent = patch.preferFeedContent;
+    if (patch.fetchStrategyOrder !== undefined) folder.fetchStrategyOrder = patch.fetchStrategyOrder;
     this._save();
     return folder;
   }
@@ -328,6 +337,34 @@ class JSONStore {
   }
   async cacheEntries() {
     return Object.entries(this._loadCache());
+  }
+  // Delete every cache entry belonging to one feed (used when rules that
+  // change article content — block rules, preferFeedContent,
+  // fetchStrategyOrder — are saved for that feed). In-memory, so this is
+  // already cheap for JSONStore; the SupabaseStore counterpart is the one
+  // that matters (see its comment for why).
+  async cacheDeleteByFeedId(feedId) {
+    const data = this._loadCache();
+    let changed = false;
+    for (const [url, entry] of Object.entries(data)) {
+      if (entry.feedId === feedId) { delete data[url]; changed = true; }
+    }
+    if (changed) this._flushCache();
+  }
+  // Delete every cache entry older than cutoffTs (ms epoch). In-memory for
+  // JSONStore — cheap. See SupabaseStore's version for the real fix.
+  async cachePruneExpired(cutoffTs) {
+    const data = this._loadCache();
+    let changed = false;
+    for (const [url, entry] of Object.entries(data)) {
+      if (entry.ts < cutoffTs) { delete data[url]; changed = true; }
+    }
+    if (changed) this._flushCache();
+  }
+  // Self-hosted mode has no error_logs table to write to — the console
+  // (already visible to whoever's running the server) is the log here.
+  async logError({ source, path, message }) {
+    console.error(`[${source}-error]${path ? ` ${path}:` : ''}`, message);
   }
 }
 

@@ -37,7 +37,18 @@ create table if not exists folders (
   name      text not null,
   icon      text default '◈',
   "order"   integer default 0,
-  thumbnail_mode text
+  thumbnail_mode text,
+  -- Folder-level defaults for feeds in this folder that don't set their
+  -- own override (same precedence pattern as thumbnail_mode above: feed's
+  -- own value wins if set, else the folder's, else the global setting).
+  -- Deliberately excludes anything feed-identity/site-specific (name, url,
+  -- cssSelectors, htmlPatterns, favicon) — those don't make sense shared
+  -- across unrelated sites just because they're filed in the same folder.
+  hide_shorts           boolean,
+  inline_browser        boolean,
+  title_blocklist       jsonb default '[]',
+  prefer_feed_content   boolean,
+  fetch_strategy_order  jsonb default '[]'
 );
 create index if not exists folders_user_id_idx on folders (user_id);
 
@@ -91,3 +102,30 @@ create table if not exists article_cache (
   ts        bigint not null,
   result    jsonb not null
 );
+-- These back two filtered deletes in server/db-supabase.js
+-- (cacheDeleteByFeedId, cachePruneExpired) that intentionally never read
+-- the `result` column — without an index on feed_id/ts, Postgres has no
+-- way to satisfy either WHERE clause without visiting every row anyway,
+-- including the (potentially large — full article HTML) result column.
+create index if not exists article_cache_feed_id_idx on article_cache (feed_id);
+create index if not exists article_cache_ts_idx on article_cache (ts);
+
+-- Error log — persists both server-side (unhandled route errors) and
+-- client-side (window.onerror/unhandledrejection, and caught-but-reported
+-- UI errors) failures. Exists because Vercel's own function logs already
+-- show these (see the global error-handling middleware in server/index.js),
+-- but only for a short retention window and only for server-side errors —
+-- a client-side failure (a fetch that rejects inside a React event handler,
+-- for instance) never reaches Vercel's logs at all. Queryable from here
+-- indefinitely (well, until the lazy 30-day prune in logError below).
+create table if not exists error_logs (
+  id          bigint generated always as identity primary key,
+  created_at  timestamptz not null default now(),
+  source      text not null,   -- 'server' | 'client'
+  user_id     bigint references users(id) on delete set null,
+  path        text,
+  message     text,
+  stack       text,
+  context     jsonb
+);
+create index if not exists error_logs_created_at_idx on error_logs (created_at desc);
