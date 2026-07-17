@@ -120,7 +120,6 @@ const articleCache = {
   get: (url) => db.cacheGet(url),
   set: (url, val) => db.cacheSet(url, val),
   delete: (url) => db.cacheDelete(url),
-  entries: () => db.cacheEntries(),
 };
 async function articleTtlMs(userId) {
   // No request context at startup (userId undefined) — use the 7-day
@@ -132,12 +131,21 @@ async function articleTtlMs(userId) {
 // Prune expired entries on startup to keep the cache from growing
 // unboundedly. Best-effort — if the store isn't ready yet or this throws
 // for any reason, it's not worth failing startup over.
+//
+// A single bounded DELETE ... WHERE ts < cutoff (see cachePruneExpired),
+// not the previous pattern of pulling every cache row's full content into
+// JS just to compare a timestamp. This file's db comes from the same
+// createStore() factory as server/index.js and can just as easily end up
+// SupabaseStore-backed (self-hosted Electron pointed at a shared Supabase
+// project) — the full-table-pull pattern is what caused a production
+// "canceling statement due to statement timeout" / 504 there once the
+// cache table grew past a couple hundred rows, and there's no reason to
+// assume this embedded copy of the same server is exempt just because
+// it's usually run with the local JSONStore instead.
 (async () => {
   try {
     const startupTtl = await articleTtlMs();
-    for (const [url, entry] of await articleCache.entries()) {
-      if (Date.now() - entry.ts > startupTtl) await articleCache.delete(url);
-    }
+    await db.cachePruneExpired(Date.now() - startupTtl);
   } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
 })();
 
@@ -547,10 +555,7 @@ app.patch('/api/feeds/:id', async (req, res) => {
   // matters (otherwise the element picker's verification step checks
   // stale, pre-rule cached content and always reports a false negative).
   if (cssSelectors !== undefined || htmlPatterns !== undefined) {
-    const feedId = req.params.id;
-    for (const [cacheUrl, entry] of await articleCache.entries()) {
-      if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
-    }
+    await db.cacheDeleteByFeedId(req.params.id);
   }
   res.json(feedRow(feed));
 });
@@ -608,7 +613,7 @@ app.post('/api/article/clear-cache', async (req, res) => {
   if (url) {
     await articleCache.delete(url);
   } else {
-    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
+    await db.cacheClearAll();
   }
   res.json({ ok: true });
 });

@@ -1,0 +1,463 @@
+From e0549dde08cdc7a8f9f780a622381cc0668e383a Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 17 Jul 2026 19:55:51 +0000
+Subject: [PATCH 1/2] Fix silent 1000-row cap + unstable ordering on
+ article_state reads
+
+Root cause of persisting-inconsistently read state: getArticleState did
+a plain select('*') with no .range() and no .order(). Supabase/PostgREST
+caps any single response at 1000 rows by default -- with article_state
+at 2100+ rows for this account, every load was silently missing an
+arbitrary and unstable subset of read/starred articles, not a fixed
+cutoff. Two fixes, both required:
+
+- Paginate past the 1000-row cap with .range() so every row is read,
+  regardless of table size.
+- Add .order('key') so the pagination is actually deterministic -- range()
+  pagination is undefined without a stable order, especially against a
+  table this frequently written to (every article read fires one
+  upsert). This is very likely the actual mechanism behind "some
+  articles get marked read but it's inconsistent which": not a fixed
+  set of rows lost every time, but a different arbitrary ~1000-row
+  subset winning the race on each load.
+
+Also:
+- server/supabase-schema.sql, live DB migration: add article_state.updated_at
+  (auto-set via trigger) -- nothing reads it yet, but there was
+  previously no way to tell, short of guessing, whether a given row's
+  write had actually landed or when. Needed exactly this conversation
+  to debug the above with any confidence.
+- server/db-supabase.js, server/db.js, server/index.js: replace the
+  clear-all-cache route's full-table-scan-then-loop (same anti-pattern
+  as the article_cache fixes in the previous commit, and subject to the
+  same 1000-row cap) with a single unconditional delete.
+---
+ server/db-supabase.js      | 49 +++++++++++++++++++++++++++++++++++---
+ server/db.js               |  5 ++++
+ server/index.js            |  2 +-
+ server/supabase-schema.sql | 26 ++++++++++++++++++++
+ 4 files changed, 78 insertions(+), 4 deletions(-)
+
+diff --git a/server/db-supabase.js b/server/db-supabase.js
+index 302a638..50d4b16 100644
+--- a/server/db-supabase.js
++++ b/server/db-supabase.js
+@@ -269,10 +269,42 @@ class SupabaseStore {
+   }
+ 
+   // ─── Article state ───────────────────────────────────────────────────────
++  // Supabase/PostgREST caps any single response at 1000 rows by default
++  // (a project-wide setting, not something this query opts into or out
++  // of) — a plain select('*') with no .range() silently returns only the
++  // first 1000 matching rows, in whatever order Postgres happens to
++  // produce them in, with no error or indication of truncation. Every
++  // article read/starred beyond that cap would come back missing on this
++  // read, every time, for any user who's read more than ~1000 articles —
++  // which looks exactly like "read state doesn't persist," except
++  // silently affecting an arbitrary subset rather than consistently
++  // affecting the oldest or newest. Paginating with .range() here fetches
++  // every row regardless of table size.
+   async getArticleState(userId) {
+-    const { data, error } = await this.sb.from('article_state').select('*').eq('user_id', userId);
+-    this._throw(error, 'getArticleState');
+-    const rows = data || [];
++    const pageSize = 1000;
++    let rows = [], from = 0;
++    while (true) {
++      // .order('key') is load-bearing, not cosmetic: without an explicit
++      // order, Postgres/PostgREST make no guarantee about which rows come
++      // back first for a plain select — and article_state gets written to
++      // constantly (every article read fires one upsert), so which ~1000
++      // rows happened to come back first was never stable from one
++      // request to the next even before pagination existed. That's almost
++      // certainly what "some articles get marked read but it's
++      // inconsistent which" actually was: not a fixed cutoff losing the
++      // same rows every time, but an arbitrary, shifting subset of a
++      // 2,100+ row table being returned as "the" read set on each load.
++      // .range() pagination specifically requires this to be safe at all —
++      // without a stable order, two successive range() calls (this loop
++      // makes several, since the table is already over 2x the 1000-row
++      // page size) have no guarantee of seeing a consistent sequence,
++      // which could skip or double-count rows across the page boundary.
++      const { data, error } = await this.sb.from('article_state').select('*').eq('user_id', userId).order('key', { ascending: true }).range(from, from + pageSize - 1);
++      this._throw(error, 'getArticleState');
++      rows = rows.concat(data || []);
++      if (!data || data.length < pageSize) break;
++      from += pageSize;
++    }
+     return { read: rows.filter(r => r.is_read).map(r => r.key), starred: rows.filter(r => r.is_starred).map(r => r.key) };
+   }
+   async markRead(userId, key, read = true) {
+@@ -356,6 +388,17 @@ class SupabaseStore {
+     const { error } = await this.sb.from('article_cache').delete().lt('ts', cutoffTs);
+     this._throw(error, 'cachePruneExpired');
+   }
++  // "Clear all" — single unconditional delete instead of pulling every row
++  // (via the old cacheEntries() pattern) and deleting one at a time. That
++  // pattern had the exact same latent bug that broke read-state
++  // persistence: an unbounded select('*') is silently capped at 1000 rows
++  // by Supabase's default API setting, so "clear all cache" on a table
++  // with more than 1000 rows would leave the rest behind with no
++  // indication anything was skipped.
++  async cacheClearAll() {
++    const { error } = await this.sb.from('article_cache').delete().neq('url', '');
++    this._throw(error, 'cacheClearAll');
++  }
+ 
+   // ─── Error log ───────────────────────────────────────────────────────────
+   // Deliberately swallows its own errors (logging must never be the thing
+diff --git a/server/db.js b/server/db.js
+index cf8f8a7..491a90b 100644
+--- a/server/db.js
++++ b/server/db.js
+@@ -361,6 +361,11 @@ class JSONStore {
+     }
+     if (changed) this._flushCache();
+   }
++  async cacheClearAll() {
++    this._loadCache();
++    this._cacheData = {};
++    this._flushCache();
++  }
+   // Self-hosted mode has no error_logs table to write to — the console
+   // (already visible to whoever's running the server) is the log here.
+   async logError({ source, path, message }) {
+diff --git a/server/index.js b/server/index.js
+index 6ee0c0c..2a8be71 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -917,7 +917,7 @@ app.post('/api/article/clear-cache', async (req, res) => {
+   if (url) {
+     await articleCache.delete(articleContentCacheKey(url));
+   } else {
+-    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
++    await db.cacheClearAll();
+   }
+   res.json({ ok: true });
+ });
+diff --git a/server/supabase-schema.sql b/server/supabase-schema.sql
+index 0dd69c1..d850695 100644
+--- a/server/supabase-schema.sql
++++ b/server/supabase-schema.sql
+@@ -77,10 +77,36 @@ create table if not exists article_state (
+   user_id     bigint not null references users(id) on delete cascade,
+   is_read     boolean default false,
+   is_starred  boolean default false,
++  -- Not read by any app code directly — exists so this table's actual
++  -- write activity can be inspected/debugged (e.g. "is this really being
++  -- written to, or is the problem on the read side") without guessing.
++  updated_at  timestamptz not null default now(),
+   primary key (key, user_id)
+ );
+ create index if not exists article_state_user_id_idx on article_state (user_id);
+ 
++create or replace function set_updated_at() returns trigger as $$
++begin
++  new.updated_at := now();
++  return new;
++end;
++$$ language plpgsql;
++drop trigger if exists article_state_set_updated_at on article_state;
++create trigger article_state_set_updated_at
++  before insert or update on article_state
++  for each row execute function set_updated_at();
++
++-- server/db-supabase.js's getArticleState reads this table with an
++-- explicit ORDER BY key and paginates past Supabase's default 1000-row
++-- response cap (this table has no natural size limit — it gains one row
++-- per article a user has ever read or starred, and grows without bound).
++-- Both matter: without .range() pagination, any user who's read more
++-- than ~1000 articles silently gets an incomplete read/starred set on
++-- every load; without the matching ORDER BY, which ~1000-row subset
++-- comes back is undefined and can change between requests on a table
++-- this frequently written to, which is what "some articles show as read
++-- and it's inconsistent which" turned out to actually be.
++
+ create table if not exists user_settings (
+   user_id  bigint primary key references users(id) on delete cascade,
+   data     jsonb not null default '{}'
+-- 
+2.43.0
+
+
+From ebd0f3453116ec72cd10b2383dd2e35a04c1a24f Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 17 Jul 2026 20:04:59 +0000
+Subject: [PATCH 2/2] Audit pass: remove dead full-table-scan cache method, fix
+ stale-closure auto-refresh bug, trim unused fields from resolveFeedRules,
+ batch folder cache-busting
+
+- server/db.js, server/db-supabase.js: remove cacheEntries() entirely.
+  It had zero remaining callers after the last two commits' fixes, and
+  leaving an unbounded full-table-pull method sitting around unused is
+  exactly the kind of landmine that caused the 504/timeout bug in the
+  first place -- someone (or some future me) reaching for the obvious-
+  looking 'get everything' method next time is how this happens again.
+- src/main/index.js: this file turned out to have its OWN duplicate copy
+  of the same three call sites (startup prune, feed-rules cache-bust,
+  clear-all-cache) that server/index.js already had fixed -- missed
+  entirely in the last two commits since attention was on
+  server/index.js specifically. Since cacheEntries() is now gone from
+  both stores, these three spots would have thrown outright if this
+  file's createStore() ever resolved to SupabaseStore (it uses the same
+  factory as server/index.js, so it's not guaranteed to always be
+  JSONStore). Fixed all three the same way: cachePruneExpired /
+  cacheDeleteByFeedId / cacheClearAll. Also cleaned up orphaned braces
+  left over from the removed for-loop in the feed-rules route.
+- server/index.js: resolveFeedRules was computing and merging
+  titleBlocklist and inlineBrowser on every feed on every fetch-all call
+  -- confirmed against src/core/fetcher.js that neither field is ever
+  read server-side (both are client-side-only filters, already handled
+  separately in App.jsx). Trimmed to just the three fields fetcher.js
+  actually consumes (hideShorts, preferFeedContent, fetchStrategyOrder).
+- server/index.js, server/db-supabase.js, server/db.js: folder-level
+  settings PATCH was busting cache with one DELETE per feed in the
+  folder (Promise.all over N individual round-trips); added
+  cacheDeleteByFeedIds for a single batched delete instead.
+- src/renderer/App.jsx: the auto-refresh timer closed over feeds_ at
+  whatever value it had when the effect last ran ([refreshIntervalMinutes,
+  feeds_.length] deps), so adding one feed and removing another between
+  ticks (anything that doesn't change the count) would silently refresh
+  a stale feed list until the count next changed. Added feedsRef,
+  mirroring the existing articlesRef pattern, so the timer always reads
+  the current list.
+---
+ server/db-supabase.js | 28 ++++++++++++++++------------
+ server/db.js          | 12 +++++++++---
+ server/index.js       | 26 ++++++++++++++++----------
+ src/main/index.js     | 23 ++++++++++++++---------
+ src/renderer/App.jsx  | 11 ++++++++++-
+ 5 files changed, 65 insertions(+), 35 deletions(-)
+
+diff --git a/server/db-supabase.js b/server/db-supabase.js
+index 50d4b16..7654001 100644
+--- a/server/db-supabase.js
++++ b/server/db-supabase.js
+@@ -357,21 +357,16 @@ class SupabaseStore {
+     const { error } = await this.sb.from('article_cache').delete().eq('url', url);
+     this._throw(error, 'cacheDelete');
+   }
+-  async cacheEntries() {
+-    const { data, error } = await this.sb.from('article_cache').select('*');
+-    this._throw(error, 'cacheEntries');
+-    return (data || []).map(row => [row.url, { ts: row.ts, feedId: row.feed_id, result: row.result }]);
+-  }
+   // Deletes cache rows for one feed directly in SQL (WHERE feed_id = ...),
+   // instead of the previous pattern used at both call sites (startup prune
+   // and the feed-rules PATCH route): pulling every row's full `result`
+-  // jsonb blob over the wire via cacheEntries() just to find the ones
+-  // matching one feedId in JS, then deleting them one HTTP round-trip at a
+-  // time. With article_cache holding a couple hundred rows averaging ~10KB
+-  // (one observed as large as 771KB) that full-table pull was measured at
+-  // ~12MB, and was the direct cause of a logged
+-  // "canceling statement due to statement timeout" error that took down
+-  // an entire /api/feeds/fetch-all request with a 504 — and, on the
++  // jsonb blob over the wire (via a since-removed cacheEntries() method)
++  // just to find the ones matching one feedId in JS, then deleting them
++  // one HTTP round-trip at a time. With article_cache holding a couple
++  // hundred rows averaging ~10KB (one observed as large as 771KB) that
++  // full-table pull was measured at ~12MB, and was the direct cause of a
++  // logged "canceling statement due to statement timeout" error that took
++  // down an entire /api/feeds/fetch-all request with a 504 — and, on the
+   // feed-rules save path, is why saving a feed's block rules (cssSelectors/
+   // htmlPatterns — exactly what the element picker writes) felt like it
+   // hung or crashed: the request was still alive, just very slow, because
+@@ -381,6 +376,15 @@ class SupabaseStore {
+     const { error } = await this.sb.from('article_cache').delete().eq('feed_id', feedId);
+     this._throw(error, 'cacheDeleteByFeedId');
+   }
++  // Same as cacheDeleteByFeedId but for many feeds at once (folder-level
++  // settings changes need to bust the cache for every feed in the
++  // folder) — one DELETE ... WHERE feed_id = ANY(...) instead of N
++  // separate round-trips.
++  async cacheDeleteByFeedIds(feedIds) {
++    if (!feedIds.length) return;
++    const { error } = await this.sb.from('article_cache').delete().in('feed_id', feedIds);
++    this._throw(error, 'cacheDeleteByFeedIds');
++  }
+   // Deletes expired cache rows directly in SQL (WHERE ts < cutoff), instead
+   // of the startup prune's previous pattern of pulling every row (see
+   // cacheDeleteByFeedId's comment) just to compare timestamps in JS.
+diff --git a/server/db.js b/server/db.js
+index 491a90b..160cce5 100644
+--- a/server/db.js
++++ b/server/db.js
+@@ -335,9 +335,6 @@ class JSONStore {
+     delete data[url];
+     this._flushCache();
+   }
+-  async cacheEntries() {
+-    return Object.entries(this._loadCache());
+-  }
+   // Delete every cache entry belonging to one feed (used when rules that
+   // change article content — block rules, preferFeedContent,
+   // fetchStrategyOrder — are saved for that feed). In-memory, so this is
+@@ -351,6 +348,15 @@ class JSONStore {
+     }
+     if (changed) this._flushCache();
+   }
++  async cacheDeleteByFeedIds(feedIds) {
++    const set = new Set(feedIds);
++    const data = this._loadCache();
++    let changed = false;
++    for (const [url, entry] of Object.entries(data)) {
++      if (set.has(entry.feedId)) { delete data[url]; changed = true; }
++    }
++    if (changed) this._flushCache();
++  }
+   // Delete every cache entry older than cutoffTs (ms epoch). In-memory for
+   // JSONStore — cheap. See SupabaseStore's version for the real fix.
+   async cachePruneExpired(cutoffTs) {
+diff --git a/server/index.js b/server/index.js
+index 2a8be71..ca79071 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -132,7 +132,6 @@ const articleCache = {
+   get: (url) => db.cacheGet(url),
+   set: (url, val) => db.cacheSet(url, val),
+   delete: (url) => db.cacheDelete(url),
+-  entries: () => db.cacheEntries(),
+ };
+ 
+ // Article *content* specifically (not the feed cache or video-duration
+@@ -625,6 +624,15 @@ app.post('/api/client-error', async (req, res) => {
+ // as thumbnailMode: feed's own value > folder's > global setting > code
+ // default. See resolveFeedRules below, used everywhere a feed's effective
+ // settings are needed (article fetch, feed fetch, block-rule filtering).
++//
++// titleBlocklist and inlineBrowser are deliberately NOT included in the
++// server-side resolve below: fetcher.js only ever reads hideShorts (for
++// the RSS list fetch) and preferFeedContent/fetchStrategyOrder (for
++// article content fetch) off a feed object — titleBlocklist filtering
++// and the inline-browser choice both happen client-side, where App.jsx
++// does its own feed>folder>global fallback directly. Merging those two
++// here as well would just be allocated and discarded on every feed, on
++// every fetch-all call.
+ function folderRow(f) {
+   return {
+     id: f.id, name: f.name, icon: f.icon,
+@@ -645,18 +653,14 @@ function folderRow(f) {
+ function resolveFeedRules(feedRowData, folder, settings) {
+   if (!feedRowData) return feedRowData;
+   const f = folder ? folderRow(folder) : null;
++  const notEmpty = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0);
+   const pick = (feedVal, folderVal, globalVal, fallback) =>
+-    (feedVal !== null && feedVal !== undefined && feedVal !== '' && !(Array.isArray(feedVal) && feedVal.length === 0)) ? feedVal
+-    : (folderVal !== null && folderVal !== undefined && folderVal !== '' && !(Array.isArray(folderVal) && folderVal.length === 0)) ? folderVal
+-    : (globalVal !== null && globalVal !== undefined) ? globalVal
+-    : fallback;
++    notEmpty(feedVal) ? feedVal : notEmpty(folderVal) ? folderVal : notEmpty(globalVal) ? globalVal : fallback;
+   return {
+     ...feedRowData,
+     hideShorts: pick(feedRowData.hideShorts, f?.hideShorts, null, false),
+-    inlineBrowser: pick(feedRowData.inlineBrowser, f?.inlineBrowser, null, false),
+-    titleBlocklist: [...(feedRowData.titleBlocklist || []), ...(f?.titleBlocklist || [])],
+     preferFeedContent: pick(feedRowData.preferFeedContent, f?.preferFeedContent, null, false),
+-    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder?.length ? feedRowData.fetchStrategyOrder : null, f?.fetchStrategyOrder?.length ? f.fetchStrategyOrder : null, settings?.fetchStrategyOrder?.length ? settings.fetchStrategyOrder : null, []),
++    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder, f?.fetchStrategyOrder, settings?.fetchStrategyOrder, []),
+   };
+ }
+ app.get('/api/folders', async (req, res) => {
+@@ -694,8 +698,10 @@ app.patch('/api/folders/:id', async (req, res) => {
+   // A single filtered delete per feed — see cacheDeleteByFeedId's comment
+   // for why this must never fall back to a full-table scan.
+   if (preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
+-    const feedsInFolder = (await db.listFeeds(req.userId)).filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length);
+-    await Promise.all(feedsInFolder.map(f => db.cacheDeleteByFeedId(f.id)));
++    const feedIds = (await db.listFeeds(req.userId))
++      .filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length)
++      .map(f => f.id);
++    await db.cacheDeleteByFeedIds(feedIds);
+   }
+   res.json(folderRow(folder));
+ });
+diff --git a/src/main/index.js b/src/main/index.js
+index 2815036..939c41e 100644
+--- a/src/main/index.js
++++ b/src/main/index.js
+@@ -120,7 +120,6 @@ const articleCache = {
+   get: (url) => db.cacheGet(url),
+   set: (url, val) => db.cacheSet(url, val),
+   delete: (url) => db.cacheDelete(url),
+-  entries: () => db.cacheEntries(),
+ };
+ async function articleTtlMs(userId) {
+   // No request context at startup (userId undefined) — use the 7-day
+@@ -132,12 +131,21 @@ async function articleTtlMs(userId) {
+ // Prune expired entries on startup to keep the cache from growing
+ // unboundedly. Best-effort — if the store isn't ready yet or this throws
+ // for any reason, it's not worth failing startup over.
++//
++// A single bounded DELETE ... WHERE ts < cutoff (see cachePruneExpired),
++// not the previous pattern of pulling every cache row's full content into
++// JS just to compare a timestamp. This file's db comes from the same
++// createStore() factory as server/index.js and can just as easily end up
++// SupabaseStore-backed (self-hosted Electron pointed at a shared Supabase
++// project) — the full-table-pull pattern is what caused a production
++// "canceling statement due to statement timeout" / 504 there once the
++// cache table grew past a couple hundred rows, and there's no reason to
++// assume this embedded copy of the same server is exempt just because
++// it's usually run with the local JSONStore instead.
+ (async () => {
+   try {
+     const startupTtl = await articleTtlMs();
+-    for (const [url, entry] of await articleCache.entries()) {
+-      if (Date.now() - entry.ts > startupTtl) await articleCache.delete(url);
+-    }
++    await db.cachePruneExpired(Date.now() - startupTtl);
+   } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
+ })();
+ 
+@@ -547,10 +555,7 @@ app.patch('/api/feeds/:id', async (req, res) => {
+   // matters (otherwise the element picker's verification step checks
+   // stale, pre-rule cached content and always reports a false negative).
+   if (cssSelectors !== undefined || htmlPatterns !== undefined) {
+-    const feedId = req.params.id;
+-    for (const [cacheUrl, entry] of await articleCache.entries()) {
+-      if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
+-    }
++    await db.cacheDeleteByFeedId(req.params.id);
+   }
+   res.json(feedRow(feed));
+ });
+@@ -608,7 +613,7 @@ app.post('/api/article/clear-cache', async (req, res) => {
+   if (url) {
+     await articleCache.delete(url);
+   } else {
+-    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
++    await db.cacheClearAll();
+   }
+   res.json({ ok: true });
+ });
+diff --git a/src/renderer/App.jsx b/src/renderer/App.jsx
+index dd00e15..430f462 100644
+--- a/src/renderer/App.jsx
++++ b/src/renderer/App.jsx
+@@ -3590,6 +3590,15 @@ export default function App() {
+   const [bootstrapping, setBootstrapping] = useState(!_cached.feeds);
+   const articlesRef = useRef([]); // keeps current articles accessible inside refreshFeeds useCallback
+   useEffect(() => { articlesRef.current = articles; }, [articles]);
++  // Same reasoning as articlesRef: the auto-refresh interval below is set
++  // up once per [refreshIntervalMinutes, feeds_.length] change and then
++  // just ticks on its own timer, closing over whatever `feeds_` was at
++  // setup time. Adding one feed and removing another between ticks (or
++  // any edit that doesn't change the *count*) would otherwise silently
++  // refresh a stale, no-longer-accurate feed list until the count next
++  // changes and the effect re-runs.
++  const feedsRef = useRef([]);
++  useEffect(() => { feedsRef.current = feeds_; }, [feeds_]);
+   const [activeView,setActiveView] = useState('__all');
+   const [selectedArticle,setSelectedArticle] = useState(null);
+   const [refreshing,setRefreshing] = useState(false);
+@@ -3788,7 +3797,7 @@ export default function App() {
+       // simultaneously changed in feed contents.
+       const prevIds = new Set(articlesRef.current.map(a=>a.id));
+       const state = await api.articles.getState();
+-      await refreshFeeds(feeds_, state, undefined, true);
++      await refreshFeeds(feedsRef.current, state, undefined, true);
+       setArticles(curr => {
+         const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
+         if (newCount > 0) setNewArticleCount(n => n + newCount);
+-- 
+2.43.0
+

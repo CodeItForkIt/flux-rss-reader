@@ -132,7 +132,6 @@ const articleCache = {
   get: (url) => db.cacheGet(url),
   set: (url, val) => db.cacheSet(url, val),
   delete: (url) => db.cacheDelete(url),
-  entries: () => db.cacheEntries(),
 };
 
 // Article *content* specifically (not the feed cache or video-duration
@@ -625,6 +624,15 @@ app.post('/api/client-error', async (req, res) => {
 // as thumbnailMode: feed's own value > folder's > global setting > code
 // default. See resolveFeedRules below, used everywhere a feed's effective
 // settings are needed (article fetch, feed fetch, block-rule filtering).
+//
+// titleBlocklist and inlineBrowser are deliberately NOT included in the
+// server-side resolve below: fetcher.js only ever reads hideShorts (for
+// the RSS list fetch) and preferFeedContent/fetchStrategyOrder (for
+// article content fetch) off a feed object — titleBlocklist filtering
+// and the inline-browser choice both happen client-side, where App.jsx
+// does its own feed>folder>global fallback directly. Merging those two
+// here as well would just be allocated and discarded on every feed, on
+// every fetch-all call.
 function folderRow(f) {
   return {
     id: f.id, name: f.name, icon: f.icon,
@@ -645,18 +653,14 @@ function folderRow(f) {
 function resolveFeedRules(feedRowData, folder, settings) {
   if (!feedRowData) return feedRowData;
   const f = folder ? folderRow(folder) : null;
+  const notEmpty = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0);
   const pick = (feedVal, folderVal, globalVal, fallback) =>
-    (feedVal !== null && feedVal !== undefined && feedVal !== '' && !(Array.isArray(feedVal) && feedVal.length === 0)) ? feedVal
-    : (folderVal !== null && folderVal !== undefined && folderVal !== '' && !(Array.isArray(folderVal) && folderVal.length === 0)) ? folderVal
-    : (globalVal !== null && globalVal !== undefined) ? globalVal
-    : fallback;
+    notEmpty(feedVal) ? feedVal : notEmpty(folderVal) ? folderVal : notEmpty(globalVal) ? globalVal : fallback;
   return {
     ...feedRowData,
     hideShorts: pick(feedRowData.hideShorts, f?.hideShorts, null, false),
-    inlineBrowser: pick(feedRowData.inlineBrowser, f?.inlineBrowser, null, false),
-    titleBlocklist: [...(feedRowData.titleBlocklist || []), ...(f?.titleBlocklist || [])],
     preferFeedContent: pick(feedRowData.preferFeedContent, f?.preferFeedContent, null, false),
-    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder?.length ? feedRowData.fetchStrategyOrder : null, f?.fetchStrategyOrder?.length ? f.fetchStrategyOrder : null, settings?.fetchStrategyOrder?.length ? settings.fetchStrategyOrder : null, []),
+    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder, f?.fetchStrategyOrder, settings?.fetchStrategyOrder, []),
   };
 }
 app.get('/api/folders', async (req, res) => {
@@ -694,8 +698,10 @@ app.patch('/api/folders/:id', async (req, res) => {
   // A single filtered delete per feed — see cacheDeleteByFeedId's comment
   // for why this must never fall back to a full-table scan.
   if (preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
-    const feedsInFolder = (await db.listFeeds(req.userId)).filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length);
-    await Promise.all(feedsInFolder.map(f => db.cacheDeleteByFeedId(f.id)));
+    const feedIds = (await db.listFeeds(req.userId))
+      .filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length)
+      .map(f => f.id);
+    await db.cacheDeleteByFeedIds(feedIds);
   }
   res.json(folderRow(folder));
 });
@@ -917,7 +923,7 @@ app.post('/api/article/clear-cache', async (req, res) => {
   if (url) {
     await articleCache.delete(articleContentCacheKey(url));
   } else {
-    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
+    await db.cacheClearAll();
   }
   res.json({ ok: true });
 });

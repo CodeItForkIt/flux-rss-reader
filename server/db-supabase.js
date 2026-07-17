@@ -269,10 +269,42 @@ class SupabaseStore {
   }
 
   // ─── Article state ───────────────────────────────────────────────────────
+  // Supabase/PostgREST caps any single response at 1000 rows by default
+  // (a project-wide setting, not something this query opts into or out
+  // of) — a plain select('*') with no .range() silently returns only the
+  // first 1000 matching rows, in whatever order Postgres happens to
+  // produce them in, with no error or indication of truncation. Every
+  // article read/starred beyond that cap would come back missing on this
+  // read, every time, for any user who's read more than ~1000 articles —
+  // which looks exactly like "read state doesn't persist," except
+  // silently affecting an arbitrary subset rather than consistently
+  // affecting the oldest or newest. Paginating with .range() here fetches
+  // every row regardless of table size.
   async getArticleState(userId) {
-    const { data, error } = await this.sb.from('article_state').select('*').eq('user_id', userId);
-    this._throw(error, 'getArticleState');
-    const rows = data || [];
+    const pageSize = 1000;
+    let rows = [], from = 0;
+    while (true) {
+      // .order('key') is load-bearing, not cosmetic: without an explicit
+      // order, Postgres/PostgREST make no guarantee about which rows come
+      // back first for a plain select — and article_state gets written to
+      // constantly (every article read fires one upsert), so which ~1000
+      // rows happened to come back first was never stable from one
+      // request to the next even before pagination existed. That's almost
+      // certainly what "some articles get marked read but it's
+      // inconsistent which" actually was: not a fixed cutoff losing the
+      // same rows every time, but an arbitrary, shifting subset of a
+      // 2,100+ row table being returned as "the" read set on each load.
+      // .range() pagination specifically requires this to be safe at all —
+      // without a stable order, two successive range() calls (this loop
+      // makes several, since the table is already over 2x the 1000-row
+      // page size) have no guarantee of seeing a consistent sequence,
+      // which could skip or double-count rows across the page boundary.
+      const { data, error } = await this.sb.from('article_state').select('*').eq('user_id', userId).order('key', { ascending: true }).range(from, from + pageSize - 1);
+      this._throw(error, 'getArticleState');
+      rows = rows.concat(data || []);
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
     return { read: rows.filter(r => r.is_read).map(r => r.key), starred: rows.filter(r => r.is_starred).map(r => r.key) };
   }
   async markRead(userId, key, read = true) {
@@ -325,21 +357,16 @@ class SupabaseStore {
     const { error } = await this.sb.from('article_cache').delete().eq('url', url);
     this._throw(error, 'cacheDelete');
   }
-  async cacheEntries() {
-    const { data, error } = await this.sb.from('article_cache').select('*');
-    this._throw(error, 'cacheEntries');
-    return (data || []).map(row => [row.url, { ts: row.ts, feedId: row.feed_id, result: row.result }]);
-  }
   // Deletes cache rows for one feed directly in SQL (WHERE feed_id = ...),
   // instead of the previous pattern used at both call sites (startup prune
   // and the feed-rules PATCH route): pulling every row's full `result`
-  // jsonb blob over the wire via cacheEntries() just to find the ones
-  // matching one feedId in JS, then deleting them one HTTP round-trip at a
-  // time. With article_cache holding a couple hundred rows averaging ~10KB
-  // (one observed as large as 771KB) that full-table pull was measured at
-  // ~12MB, and was the direct cause of a logged
-  // "canceling statement due to statement timeout" error that took down
-  // an entire /api/feeds/fetch-all request with a 504 — and, on the
+  // jsonb blob over the wire (via a since-removed cacheEntries() method)
+  // just to find the ones matching one feedId in JS, then deleting them
+  // one HTTP round-trip at a time. With article_cache holding a couple
+  // hundred rows averaging ~10KB (one observed as large as 771KB) that
+  // full-table pull was measured at ~12MB, and was the direct cause of a
+  // logged "canceling statement due to statement timeout" error that took
+  // down an entire /api/feeds/fetch-all request with a 504 — and, on the
   // feed-rules save path, is why saving a feed's block rules (cssSelectors/
   // htmlPatterns — exactly what the element picker writes) felt like it
   // hung or crashed: the request was still alive, just very slow, because
@@ -349,12 +376,32 @@ class SupabaseStore {
     const { error } = await this.sb.from('article_cache').delete().eq('feed_id', feedId);
     this._throw(error, 'cacheDeleteByFeedId');
   }
+  // Same as cacheDeleteByFeedId but for many feeds at once (folder-level
+  // settings changes need to bust the cache for every feed in the
+  // folder) — one DELETE ... WHERE feed_id = ANY(...) instead of N
+  // separate round-trips.
+  async cacheDeleteByFeedIds(feedIds) {
+    if (!feedIds.length) return;
+    const { error } = await this.sb.from('article_cache').delete().in('feed_id', feedIds);
+    this._throw(error, 'cacheDeleteByFeedIds');
+  }
   // Deletes expired cache rows directly in SQL (WHERE ts < cutoff), instead
   // of the startup prune's previous pattern of pulling every row (see
   // cacheDeleteByFeedId's comment) just to compare timestamps in JS.
   async cachePruneExpired(cutoffTs) {
     const { error } = await this.sb.from('article_cache').delete().lt('ts', cutoffTs);
     this._throw(error, 'cachePruneExpired');
+  }
+  // "Clear all" — single unconditional delete instead of pulling every row
+  // (via the old cacheEntries() pattern) and deleting one at a time. That
+  // pattern had the exact same latent bug that broke read-state
+  // persistence: an unbounded select('*') is silently capped at 1000 rows
+  // by Supabase's default API setting, so "clear all cache" on a table
+  // with more than 1000 rows would leave the rest behind with no
+  // indication anything was skipped.
+  async cacheClearAll() {
+    const { error } = await this.sb.from('article_cache').delete().neq('url', '');
+    this._throw(error, 'cacheClearAll');
   }
 
   // ─── Error log ───────────────────────────────────────────────────────────

@@ -77,9 +77,35 @@ create table if not exists article_state (
   user_id     bigint not null references users(id) on delete cascade,
   is_read     boolean default false,
   is_starred  boolean default false,
+  -- Not read by any app code directly — exists so this table's actual
+  -- write activity can be inspected/debugged (e.g. "is this really being
+  -- written to, or is the problem on the read side") without guessing.
+  updated_at  timestamptz not null default now(),
   primary key (key, user_id)
 );
 create index if not exists article_state_user_id_idx on article_state (user_id);
+
+create or replace function set_updated_at() returns trigger as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$ language plpgsql;
+drop trigger if exists article_state_set_updated_at on article_state;
+create trigger article_state_set_updated_at
+  before insert or update on article_state
+  for each row execute function set_updated_at();
+
+-- server/db-supabase.js's getArticleState reads this table with an
+-- explicit ORDER BY key and paginates past Supabase's default 1000-row
+-- response cap (this table has no natural size limit — it gains one row
+-- per article a user has ever read or starred, and grows without bound).
+-- Both matter: without .range() pagination, any user who's read more
+-- than ~1000 articles silently gets an incomplete read/starred set on
+-- every load; without the matching ORDER BY, which ~1000-row subset
+-- comes back is undefined and can change between requests on a table
+-- this frequently written to, which is what "some articles show as read
+-- and it's inconsistent which" turned out to actually be.
 
 create table if not exists user_settings (
   user_id  bigint primary key references users(id) on delete cascade,

@@ -335,9 +335,6 @@ class JSONStore {
     delete data[url];
     this._flushCache();
   }
-  async cacheEntries() {
-    return Object.entries(this._loadCache());
-  }
   // Delete every cache entry belonging to one feed (used when rules that
   // change article content — block rules, preferFeedContent,
   // fetchStrategyOrder — are saved for that feed). In-memory, so this is
@@ -351,6 +348,15 @@ class JSONStore {
     }
     if (changed) this._flushCache();
   }
+  async cacheDeleteByFeedIds(feedIds) {
+    const set = new Set(feedIds);
+    const data = this._loadCache();
+    let changed = false;
+    for (const [url, entry] of Object.entries(data)) {
+      if (set.has(entry.feedId)) { delete data[url]; changed = true; }
+    }
+    if (changed) this._flushCache();
+  }
   // Delete every cache entry older than cutoffTs (ms epoch). In-memory for
   // JSONStore — cheap. See SupabaseStore's version for the real fix.
   async cachePruneExpired(cutoffTs) {
@@ -360,6 +366,11 @@ class JSONStore {
       if (entry.ts < cutoffTs) { delete data[url]; changed = true; }
     }
     if (changed) this._flushCache();
+  }
+  async cacheClearAll() {
+    this._loadCache();
+    this._cacheData = {};
+    this._flushCache();
   }
   // Self-hosted mode has no error_logs table to write to — the console
   // (already visible to whoever's running the server) is the log here.

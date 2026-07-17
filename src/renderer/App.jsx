@@ -3590,6 +3590,15 @@ export default function App() {
   const [bootstrapping, setBootstrapping] = useState(!_cached.feeds);
   const articlesRef = useRef([]); // keeps current articles accessible inside refreshFeeds useCallback
   useEffect(() => { articlesRef.current = articles; }, [articles]);
+  // Same reasoning as articlesRef: the auto-refresh interval below is set
+  // up once per [refreshIntervalMinutes, feeds_.length] change and then
+  // just ticks on its own timer, closing over whatever `feeds_` was at
+  // setup time. Adding one feed and removing another between ticks (or
+  // any edit that doesn't change the *count*) would otherwise silently
+  // refresh a stale, no-longer-accurate feed list until the count next
+  // changes and the effect re-runs.
+  const feedsRef = useRef([]);
+  useEffect(() => { feedsRef.current = feeds_; }, [feeds_]);
   const [activeView,setActiveView] = useState('__all');
   const [selectedArticle,setSelectedArticle] = useState(null);
   const [refreshing,setRefreshing] = useState(false);
@@ -3788,7 +3797,7 @@ export default function App() {
       // simultaneously changed in feed contents.
       const prevIds = new Set(articlesRef.current.map(a=>a.id));
       const state = await api.articles.getState();
-      await refreshFeeds(feeds_, state, undefined, true);
+      await refreshFeeds(feedsRef.current, state, undefined, true);
       setArticles(curr => {
         const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
         if (newCount > 0) setNewArticleCount(n => n + newCount);
