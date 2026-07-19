@@ -19,18 +19,6 @@
  */
 
 const express  = require('express');
-// Patches Express's router so a thrown/rejected error inside any async
-// route handler is automatically forwarded to the error-handling
-// middleware below, instead of becoming an unhandled rejection that
-// Express 4 silently ignores. Without this, a route like
-// `app.patch('/api/feeds/:id', async (req, res) => { await
-// db.updateFeed(...) /* throws */ })` never sends any response at all —
-// the request just hangs until Vercel's 30-second function maxDuration
-// kills it, which from the client's perspective looks exactly like a
-// button that's stuck ("Saving…" forever) rather than a fast, clear
-// error. Must be required after express and before any routes are
-// defined; it works by monkey-patching express.Router.
-require('express-async-errors');
 const cors     = require('cors');
 const path     = require('path');
 const fs       = require('fs');
@@ -48,7 +36,7 @@ const { createStore } = require('./store-factory');
 const { getSessionToken, setSessionCookie, clearSessionCookie } = require('./auth-utils');
 
 const {
-  loadDeps, fetchArticle, fetchFeed, fetchFeedAvatar, fetchYoutubeVideoDuration, fetchWithCookies, MOBILE_UA,
+  loadDeps, fetchArticle, fetchFeed, fetchWithCookies,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest, resolveFeedUrl,
 } = require('../src/core/fetcher');
 
@@ -121,25 +109,7 @@ const db = createStore(DB_PATH);
 // from the caller's device-session token, rather than a hardcoded stub.
 
 // ─── In-memory cookie jars ────────────────────────────────────────────────────
-// Keyed by userId, each holding its own domain → jar map — NOT a single
-// shared object. This used to be one flat `{}` shared across every user on
-// this process, keyed only by domain: fetcher.js's own getCookieJar comment
-// says "each user gets their own CookieStore passed in", but nothing here
-// ever actually did that — every call site below passed the exact same
-// object regardless of which user's request it was. In practice that meant
-// any cookie a site set in response to one user's traffic — most
-// seriously, a login session established through the inline browser — got
-// stored keyed only by domain, and was then silently attached to every
-// other Flux user's requests to that same domain: feed fetches, the
-// inline-browser proxy, article fetching, all of it. One user logging into
-// a site through the inline browser could leak their authenticated session
-// to every other user of this deployment who has a feed from, or opens,
-// that same domain.
-const cookieJarsByUser = new Map();
-function userCookieJars(userId) {
-  if (!cookieJarsByUser.has(userId)) cookieJarsByUser.set(userId, {});
-  return cookieJarsByUser.get(userId);
-}
+const cookieJars = {};
 
 // ─── Article content cache ──────────────────────────────────────────────────
 // Thin wrapper around whichever store is active (db.cacheGet/Set/Delete/
@@ -150,63 +120,13 @@ const articleCache = {
   get: (url) => db.cacheGet(url),
   set: (url, val) => db.cacheSet(url, val),
   delete: (url) => db.cacheDelete(url),
+  entries: () => db.cacheEntries(),
 };
-
-// Article *content* specifically (not the feed cache or video-duration
-// cache above/below, which use their own distinct key prefixes and aren't
-// affected by fetchArticle's logic) is keyed through this version wrapper.
-// Bump ARTICLE_CONTENT_CACHE_VERSION whenever a change to fetchArticle
-// could change what gets returned for the same URL — the old versioned
-// keys are simply never looked up again, so every previously-cached entry
-// is effectively invalidated without needing to enumerate and delete them,
-// and without waiting out the (up to 7-day-by-default) TTL. Current bump:
-// fetchArticle now prefers substantial RSS-provided content over live-
-// fetching <link> for feeds like Daring Fireball's Linked List, where
-// <link> points at an unrelated external site — any article fetched
-// before this change has the *old*, wrong result cached under the
-// unversioned key, which would otherwise keep being served until it
-// naturally expired.
-// Current bump: added teaser detection (looksLikeTeaser in core/fetcher.js)
-// on top of the plain length check from version 2 — that version-2 logic
-// is what caused The Verge (and any other publisher who deliberately
-// truncates their feed content with a "Read more" CTA) to regress, since
-// their teaser is long enough to clear a size-only bar. Articles cached
-// under version 2 have that wrongly-truncated result baked in.
-// Current bump: switched RSS-content preference from an automatic
-// length+pattern heuristic to an explicit per-feed opt-in
-// (feedRules.preferFeedContent) — see the comment in fetcher.js's
-// fetchArticle for why. Every feed that isn't explicitly opted in now
-// always live-fetches, same as the pre-DF-fix original behavior; anything
-// cached under version 3 could have RSS content applied that wouldn't be
-// applied anymore under the new logic.
-const ARTICLE_CONTENT_CACHE_VERSION = 4;
-const articleContentCacheKey = (url) => `v${ARTICLE_CONTENT_CACHE_VERSION}::${url}`;
-
-// getSettings() is called on nearly every article-fetch request just to
-// look up articleCacheDays/fetchStrategyOrder — that's a full Supabase
-// round-trip before the actual cache lookup even starts, on every single
-// request, cached or not. Settings change rarely, so a short in-memory
-// cache (per warm serverless instance) removes that round-trip for the
-// common case of a user opening several articles in quick succession,
-// without meaningfully risking staleness (worst case: a settings change
-// takes up to SETTINGS_CACHE_MS to take effect on this particular warm
-// instance — other instances/requests are unaffected).
-const SETTINGS_CACHE_MS = 30 * 1000;
-const _settingsCache = new Map(); // userId -> { ts, data }
-async function getSettingsCached(userId) {
-  const hit = _settingsCache.get(userId);
-  if (hit && Date.now() - hit.ts < SETTINGS_CACHE_MS) return hit.data;
-  const data = await db.getSettings(userId);
-  _settingsCache.set(userId, { ts: Date.now(), data });
-  return data;
-}
-function invalidateSettingsCache(userId) { _settingsCache.delete(userId); }
-
 async function articleTtlMs(userId) {
-  // No request context at startup (userId undefined) — use the 2-day
+  // No request context at startup (userId undefined) — use the 7-day
   // default rather than any specific user's setting, since this pass is
   // just a size-bounding optimization, not a per-request correctness check.
-  const days = userId != null ? ((await getSettingsCached(userId)).articleCacheDays ?? 2) : 2;
+  const days = userId != null ? ((await db.getSettings(userId)).articleCacheDays ?? 7) : 7;
   return days * 24 * 60 * 60 * 1000;
 }
 // Prune expired entries on startup to keep the cache from growing
@@ -215,132 +135,11 @@ async function articleTtlMs(userId) {
 (async () => {
   try {
     const startupTtl = await articleTtlMs();
-    // A single bounded DELETE ... WHERE ts < cutoff, instead of the
-    // previous pattern of pulling every cache row's full content
-    // (articleCache.entries()) into JS just to compare a timestamp — see
-    // the long comment on SupabaseStore.cacheDeleteByFeedId for the
-    // production timeout this caused.
-    await db.cachePruneExpired(Date.now() - startupTtl);
+    for (const [url, entry] of await articleCache.entries()) {
+      if (Date.now() - entry.ts > startupTtl) await articleCache.delete(url);
+    }
   } catch (e) { console.error('[article-cache] startup prune skipped:', e.message); }
 })();
-
-// ─── Feed content cache ──────────────────────────────────────────────────────
-// There was previously NO caching at the feed level at all — every single
-// "refresh" (including just reloading the page, since the client
-// unconditionally refetches everything on mount) re-downloaded and
-// re-parsed every subscribed feed's XML from its origin, every time. On
-// Vercel that's the dominant cause of "reloading the page takes a few
-// seconds before articles show up" — there's no persistent local cache to
-// fall back on between requests the way there would be on a
-// long-running server.
-//
-// This reuses the same generic KV store as the article cache (distinct key
-// prefix to avoid collisions with real article URLs), keyed per-user-per-feed
-// rather than globally by URL — two different users subscribed to the same
-// blog will each still fetch it independently, but that trade-off keeps this
-// simple and unambiguously safe: a cached result's items bake in the
-// requesting feed's own local ID (see fetchFeed in core/fetcher.js), so
-// sharing a cache entry across two users' differently-ID'd feed rows would
-// require remapping every article ID before returning it — not worth the
-// complexity for what's fundamentally a "don't redo identical work you just
-// did 30 seconds ago" optimization, not a cross-user dedup feature.
-//
-// TTL is intentionally short: long enough that a page reload moments after
-// the last load is instant, short enough that it never feels "behind" —
-// this is not a substitute for the explicit Refresh action or the
-// auto-refresh timer, both of which pass force:true to bypass it entirely.
-const FEED_CACHE_TTL_MS = 3 * 60 * 1000;
-const feedCacheKey = (userId, feedId) => `flux-feed-cache::${userId}::${feedId}`;
-// Checks the actual hostname rather than doing a substring match against
-// the full URL. feed.url.includes('youtube.com') (the previous check) can
-// be fooled by any URL containing that substring anywhere at all —
-// https://evil.com/?x=youtube.com or https://youtube.com.evil.com/feed
-// both pass a naive .includes() check without being youtube.com at all.
-// That matters here specifically because a feed classified as "YouTube"
-// gets its items' link fields fetched directly by fetchYoutubeVideoDuration
-// below — a feed that fooled this check controls the content it points
-// that fetch at.
-function isGenuineYoutubeFeedUrl(feedUrl) {
-  try {
-    const h = new URL(feedUrl).hostname.toLowerCase();
-    return h === 'youtube.com' || h.endsWith('.youtube.com');
-  } catch { return false; }
-}
-
-async function fetchFeedCached(userId, feed, cookieJars, force) {
-  const key = feedCacheKey(userId, feed.id);
-  if (!force) {
-    try {
-      const cached = await articleCache.get(key);
-      if (cached && Date.now() - cached.ts < FEED_CACHE_TTL_MS) return cached.result;
-    } catch (e) { console.warn('[feed-cache] read failed, falling back to live fetch:', e.message); }
-  }
-  const result = await fetchFeed(feed, cookieJars);
-
-  // YouTube video duration: RSS doesn't expose it at all (see
-  // fetchYoutubeVideoDuration's comment in core/fetcher.js), so this
-  // maintains its own small cache, keyed globally by video ID rather than
-  // per-user/per-feed like the feed-cache above — a video's duration is
-  // public, unchanging data, identical for every user who happens to
-  // subscribe to the same channel, so there's no reason to fetch or store
-  // it more than once ever, system-wide.
-  //
-  // Bounded on both axes: only the first 10 videos in this response that
-  // are missing a duration get *looked up* in the cache at all (avoids N
-  // parallel Supabase reads for a feed with dozens of items), and of
-  // those, only the first 4 that come back as genuinely uncached trigger
-  // an actual new background fetch (each one is a real HTTP request to a
-  // video's watch page — unbounded, that's a lot of outbound requests
-  // and a good way to get rate-limited on a channel with many videos).
-  // Durations found in cache are attached synchronously so they appear on
-  // this very response; newly-fetched ones are cached in the background
-  // and will appear starting next refresh.
-  if (feed.isYoutube || isGenuineYoutubeFeedUrl(feed.url)) {
-    const candidates = (result.items || []).filter(item => item.videoId && !item.duration).slice(0, 10);
-    const durKeys = candidates.map(item => `flux-video-duration::${item.videoId}`);
-    const cachedDurations = await Promise.all(durKeys.map(k => articleCache.get(k).catch(() => null)));
-    let fetchBudget = 4;
-    candidates.forEach((item, i) => {
-      if (cachedDurations[i]?.result) { item.duration = cachedDurations[i].result; return; }
-      if (fetchBudget-- <= 0) return;
-      // item.link is feed content, not a URL this server constructed
-      // itself — checked the same as any other feed-supplied URL before
-      // being fetched.
-      (async () => {
-        let hostname;
-        try { hostname = new URL(item.link).hostname; } catch { return; }
-        if (await checkSsrfSafe(hostname)) return;
-        const duration = await fetchYoutubeVideoDuration(item.link, cookieJars);
-        if (!duration) return;
-        await articleCache.set(durKeys[i], { ts: Date.now(), feedId: null, result: duration });
-      })().catch(() => {});
-    });
-  }
-
-  // Upgrade YouTube feeds from the generic fallback favicon to the real
-  // channel avatar, exactly once per feed. fetchFeedAvatar does a genuine
-  // extra HTTP fetch (scraping the channel page for its og:image, since
-  // YouTube's own feed XML doesn't expose an avatar at all) — deliberately
-  // NOT awaited here, so it can't add its ~300-800ms to this request. It
-  // runs in the background and persists straight to the feed row; the
-  // `!feed.favicon` guard is what makes this "exactly once" rather than
-  // "every single refresh" — once persisted, fetchFeed above will see
-  // feedConfig.favicon already set and skip recomputing anything, and this
-  // block won't fire again for that feed. This was previously dead code:
-  // fetchFeedAvatar existed but nothing anywhere ever called it, so every
-  // YouTube feed was permanently stuck on the generic fallback icon.
-  if (!feed.favicon && (feed.isYoutube || isGenuineYoutubeFeedUrl(feed.url))) {
-    fetchFeedAvatar(feed, cookieJars).then(async (avatarUrl) => {
-      if (!avatarUrl) return;
-      try { await db.updateFeed(userId, feed.id, { favicon: avatarUrl }); }
-      catch (e) { console.warn('[feed-avatar] failed to persist for', feed.id, e.message); }
-    }).catch(e => console.warn('[feed-avatar] fetch failed for', feed.id, e.message));
-  }
-
-  articleCache.set(key, { ts: Date.now(), feedId: null, result }).catch(e =>
-    console.warn('[feed-cache] write failed (non-fatal — this feed just won\'t be cached this round):', e.message));
-  return result;
-}
 
 // ─── SSRF guard ───────────────────────────────────────────────────────────────
 // /api/proxy, /api/feeds/resolve, and article/feed fetching all cause THIS
@@ -352,7 +151,6 @@ async function fetchFeedCached(userId, feed, cookieJars, force) {
 // private IP even when it doesn't look like one — so this resolves DNS
 // first and checks the actual resulting address.
 function isPrivateOrReservedIp(ip) {
-  ip = ip.replace(/^::ffff:/i, ''); // IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254)
   if (ip.includes(':')) { // IPv6
     const low = ip.toLowerCase();
     return low === '::1' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80') || low === '::';
@@ -397,6 +195,25 @@ async function requireAuth(req, res, next) {
   } catch (e) { res.status(500).json({ error: `Auth check failed: ${e.message}` }); }
 }
 
+function proxyBypassAllowed(req) {
+  if (req.path !== '/proxy') return false;
+  const secFetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
+  const secFetchMode = String(req.headers['sec-fetch-mode'] || '').toLowerCase();
+  const referer = req.headers.referer || '';
+  const origin = req.headers.origin || '';
+  const host = req.headers.host || '';
+  const sameOriginReferer = !!referer && (() => {
+    try {
+      const u = new URL(referer);
+      return u.origin === `${req.protocol}://${host}`;
+    } catch {
+      return false;
+    }
+  })();
+  const sameOriginOrigin = !!origin && origin === `${req.protocol}://${host}`;
+  return secFetchDest === 'iframe' || secFetchMode === 'navigate' || sameOriginReferer || sameOriginOrigin;
+}
+
 // A request originating from localhost or the same private network isn't
 // subject to the internet-facing brute-force/abuse concerns rate limiting
 // exists for — the operator running curl against their own box, or another
@@ -417,15 +234,7 @@ async function rateLimitingActive(req) {
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
 
-// This deployment always sits behind exactly one reverse proxy -- Vercel's
-// own edge network -- so trust exactly 1 hop. `true` (trust every hop) was
-// here before, and express-rate-limit's own runtime validation caught it:
-// with every hop trusted, X-Forwarded-For is just an attacker-supplied
-// string as far as Express is concerned -- prepend any fake IP and every
-// IP-keyed rate limiter below (most importantly authLimiter, guarding
-// login/2FA) keys off that instead of a real client IP, making it trivial
-// to get a fresh rate-limit bucket on every request.
-app.set('trust proxy', 1);
+app.set('trust proxy', true);
 app.use(helmet({
   contentSecurityPolicy: false, // the SPA and inline-browser proxy both need inline scripts/styles; a real CSP here would need per-route tuning
   crossOriginEmbedderPolicy: false,
@@ -436,26 +245,6 @@ app.use(cors(
     : { origin: false } // no cross-origin access by default — set CORS_ORIGIN if the frontend is served from a different origin than the API
 ));
 app.use(express.json({ limit: '2mb' }));
-
-// Every response under /api/ reflects live, mutable, per-user state (read/
-// starred status, feed list, settings, article content) — nothing here
-// should ever be served from a cache at any layer (the browser, Vercel's
-// edge network, or any intermediate proxy). Previously NOTHING in this
-// file set any Cache-Control header at all, on any route, which leaves
-// every GET endpoint cacheable by default wherever a caching layer sits
-// between the browser and this server. GET /api/articles/state in
-// particular reads back exactly what mark-read/mark-read-bulk just wrote —
-// if that read is served from a stale cache on the next page load, a
-// write that genuinely succeeded server-side would still look like it
-// "didn't persist," which is indistinguishable from the write itself
-// having failed without checking network traffic directly. Setting this
-// unconditionally, before any route runs, removes that possibility
-// entirely rather than trying to guess which specific layer might be
-// responsible for caching it.
-app.use('/api/', (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  next();
-});
 
 // Generous global limiter (guards against runaway clients/scripted abuse);
 // tighter limiter specifically on auth to slow down password guessing.
@@ -606,83 +395,20 @@ app.put('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // Every route below this line requires a valid device session token.
-// /proxy is not special-cased: requireAuth's getSessionToken already
-// checks the query ?token= param (which the client always appends when
-// building the iframe src specifically so a plain iframe navigation --
-// which can't carry a custom Authorization header -- still authenticates;
-// see InlineBrowser's proxiedSrc in App.jsx), the session cookie, and the
-// Bearer header. There is no legitimate request path that needs a bypass.
 app.use('/api/', (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path === '/health' || req.path === '/client-error') return next();
+  if (req.path.startsWith('/auth/') || req.path === '/health') return next();
+  if (req.path === '/proxy' && (proxyBypassAllowed(req) || getSessionToken(req))) return next();
   requireAuth(req, res, next);
 });
 
-// Client-side error reports (window.onerror/unhandledrejection, and a few
-// explicit catch blocks — see src/renderer/App.jsx's reportClientError).
-// Deliberately not behind requireAuth: an error can happen before login
-// (e.g. the login screen itself failing to load), and losing visibility
-// into exactly those errors would defeat the point. Still attaches a
-// userId when a valid session token is present, for correlation.
-app.post('/api/client-error', async (req, res) => {
-  let userId = null;
-  try { const session = await db.findSession(getSessionToken(req)); userId = session?.userId ?? null; } catch {}
-  const { message, stack, path, context } = req.body || {};
-  await db.logError({ source: 'client', userId, path, message, stack, context }).catch(() => {});
-  res.json({ ok: true });
-});
-
 // ─── Folders ──────────────────────────────────────────────────────────────────
-// Folder-level fields other than thumbnailMode act purely as a fallback
-// default for feeds that don't set their own override — same precedence
-// as thumbnailMode: feed's own value > folder's > global setting > code
-// default. See resolveFeedRules below, used everywhere a feed's effective
-// settings are needed (article fetch, feed fetch, block-rule filtering).
-//
-// titleBlocklist and inlineBrowser are deliberately NOT included in the
-// server-side resolve below: fetcher.js only ever reads hideShorts (for
-// the RSS list fetch) and preferFeedContent/fetchStrategyOrder (for
-// article content fetch) off a feed object — titleBlocklist filtering
-// and the inline-browser choice both happen client-side, where App.jsx
-// does its own feed>folder>global fallback directly. Merging those two
-// here as well would just be allocated and discarded on every feed, on
-// every fetch-all call.
-function folderRow(f) {
-  return {
-    id: f.id, name: f.name, icon: f.icon,
-    thumbnailMode: f.thumbnailMode || null,
-    hideShorts: f.hideShorts === true ? true : f.hideShorts === false ? false : null,
-    inlineBrowser: f.inlineBrowser === true ? true : f.inlineBrowser === false ? false : null,
-    titleBlocklist: f.titleBlocklist || [],
-    preferFeedContent: f.preferFeedContent === true ? true : f.preferFeedContent === false ? false : null,
-    fetchStrategyOrder: f.fetchStrategyOrder || [],
-  };
-}
-// Merges a feed's own rules with its folder's defaults and (for the two
-// fields that already had one) the global setting — feed wins if it set
-// an explicit value, else the folder's, else global, else the hardcoded
-// default. Boolean fields use the tri-state undefined/null-vs-false
-// convention already established for thumbnailMode/showThumbnail
-// elsewhere in this file: `null` means "not set here, fall through."
-function resolveFeedRules(feedRowData, folder, settings) {
-  if (!feedRowData) return feedRowData;
-  const f = folder ? folderRow(folder) : null;
-  const notEmpty = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0);
-  const pick = (feedVal, folderVal, globalVal, fallback) =>
-    notEmpty(feedVal) ? feedVal : notEmpty(folderVal) ? folderVal : notEmpty(globalVal) ? globalVal : fallback;
-  return {
-    ...feedRowData,
-    hideShorts: pick(feedRowData.hideShorts, f?.hideShorts, null, false),
-    preferFeedContent: pick(feedRowData.preferFeedContent, f?.preferFeedContent, null, false),
-    fetchStrategyOrder: pick(feedRowData.fetchStrategyOrder, f?.fetchStrategyOrder, settings?.fetchStrategyOrder, []),
-  };
-}
 app.get('/api/folders', async (req, res) => {
-  res.json((await db.listFolders(req.userId)).map(folderRow));
+  res.json((await db.listFolders(req.userId)).map(f => ({ id: f.id, name: f.name, icon: f.icon })));
 });
 app.post('/api/folders', async (req, res) => {
   const { name, icon } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
-  res.json(folderRow(await db.addFolder(req.userId, name, icon || '◈')));
+  res.json(await db.addFolder(req.userId, name, icon || '◈'));
 });
 app.delete('/api/folders/:id', async (req, res) => {
   await db.removeFolder(req.userId, req.params.id);
@@ -695,28 +421,10 @@ app.put('/api/folders/reorder', async (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/folders/:id', async (req, res) => {
-  const { name, icon, thumbnailMode, hideShorts, inlineBrowser, titleBlocklist, preferFeedContent, fetchStrategyOrder } = req.body;
-  const patch = { name, icon, thumbnailMode };
-  if (hideShorts !== undefined) patch.hideShorts = hideShorts;
-  if (inlineBrowser !== undefined) patch.inlineBrowser = inlineBrowser;
-  if (titleBlocklist !== undefined) patch.titleBlocklist = titleBlocklist;
-  if (preferFeedContent !== undefined) patch.preferFeedContent = preferFeedContent;
-  if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
-  const folder = await db.updateFolder(req.userId, req.params.id, patch);
+  const { name, icon } = req.body;
+  const folder = await db.updateFolder(req.userId, req.params.id, { name, icon });
   if (!folder) return res.status(404).json({ error: 'Not found' });
-  // Same reasoning as the feed-rules PATCH route: preferFeedContent and
-  // fetchStrategyOrder change what content gets returned for an article,
-  // so any feed in this folder that inherits the folder's value (i.e.
-  // doesn't have its own override) needs its cached content invalidated.
-  // A single filtered delete per feed — see cacheDeleteByFeedId's comment
-  // for why this must never fall back to a full-table scan.
-  if (preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
-    const feedIds = (await db.listFeeds(req.userId))
-      .filter(f => f.folder === req.params.id && f.preferFeedContent == null && !f.fetchStrategyOrder?.length)
-      .map(f => f.id);
-    await db.cacheDeleteByFeedIds(feedIds);
-  }
-  res.json(folderRow(folder));
+  res.json(folder);
 });
 
 // ─── Feeds ────────────────────────────────────────────────────────────────────
@@ -733,10 +441,6 @@ const feedRow = (f) => ({
   favicon:       f.favicon || null,
   titleBlocklist: f.titleBlocklist || [],
   fetchStrategyOrder: f.fetchStrategyOrder || [],
-  showThumbnail: f.showThumbnail === true ? true : f.showThumbnail === false ? false : null, // deprecated, superseded by thumbnailMode below — kept read-only for any already-set rows
-  thumbnailMode: f.thumbnailMode || null, // null = inherit global setting; 'large' | 'small' | 'none' = explicit override
-  preferFeedContent: !!f.preferFeedContent,
-  autoRefreshEnabled: f.autoRefreshEnabled !== false,
 });
 
 app.get('/api/feeds', async (req, res) => {
@@ -755,7 +459,7 @@ app.post('/api/feeds/resolve', async (req, res) => {
   const ssrfError = await checkSsrfSafe(hostname);
   if (ssrfError) return res.status(400).json({ error: ssrfError });
   try {
-    const result = await resolveFeedUrl(url, userCookieJars(req.userId));
+    const result = await resolveFeedUrl(url, cookieJars);
     res.json(result);
   } catch (e) {
     res.status(422).json({ error: e.message });
@@ -795,7 +499,7 @@ app.post('/api/feeds', async (req, res) => {
   res.json(feedRow(feed));
 });
 app.patch('/api/feeds/:id', async (req, res) => {
-  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url, showThumbnail, thumbnailMode, preferFeedContent } = req.body;
+  const { cssSelectors, htmlPatterns, inlineBrowser, hideShorts, name, folder, favicon, titleBlocklist, fetchStrategyOrder, url } = req.body;
   const patch = {};
   if (cssSelectors  !== undefined) patch.cssSelectors  = cssSelectors;
   if (htmlPatterns  !== undefined) patch.htmlPatterns  = htmlPatterns;
@@ -806,12 +510,6 @@ app.patch('/api/feeds/:id', async (req, res) => {
   if (favicon       !== undefined) patch.favicon       = favicon;
   if (titleBlocklist!== undefined) patch.titleBlocklist= titleBlocklist;
   if (fetchStrategyOrder !== undefined) patch.fetchStrategyOrder = fetchStrategyOrder;
-  // Tri-state: true/false is an explicit override, null means "inherit the
-  // global setting" — all three are meaningful, so this checks `!==
-  // undefined` (missing from the request at all) rather than truthiness.
-  if (showThumbnail !== undefined) patch.showThumbnail = showThumbnail;
-  if (thumbnailMode !== undefined) patch.thumbnailMode = thumbnailMode;
-  if (preferFeedContent !== undefined) patch.preferFeedContent = !!preferFeedContent;
   if (url !== undefined) {
     let newUrl = url.trim();
     if (!/^https?:\/\//i.test(newUrl)) newUrl = 'https://' + newUrl;
@@ -829,32 +527,19 @@ app.patch('/api/feeds/:id', async (req, res) => {
   }
   const feed = await db.updateFeed(req.userId, req.params.id, patch);
   if (!feed) return res.status(404).json({ error: 'Not found' });
-  // Changing the URL invalidates this feed's cached content — without
-  // this, fetchFeedCached would keep serving whatever was fetched under
-  // the old URL until the feed-cache TTL happens to expire on its own.
-  // Note: this targets the *feed* cache (flux-feed-cache::userId::feedId),
-  // not the article-content cache — a feed's own URL was never actually
-  // how article content gets cached, so deleting by feed.url here
-  // previously did nothing at all (stale from before the feed-cache
-  // existed as its own keyed store).
-  if (url !== undefined) await articleCache.delete(feedCacheKey(req.userId, feed.id));
-  // Bust the article cache when anything that changes what content gets
-  // returned for this feed's articles changes: block rules (see the
-  // matching comment in src/main/index.js's feeds:updateRules handler —
-  // otherwise the element picker's verification step checks stale,
-  // pre-rule cached content and always reports a false negative),
-  // preferFeedContent (switches between live-fetching and using the
-  // feed's own RSS content — an already-cached live-fetched result would
-  // otherwise keep being served after turning this on, and vice versa),
-  // and fetchStrategyOrder (changes which paywall-bypass strategy gets
-  // tried first, which can produce a different result for the same URL).
-  if (cssSelectors !== undefined || htmlPatterns !== undefined || preferFeedContent !== undefined || fetchStrategyOrder !== undefined) {
-    // Single filtered DELETE (WHERE feed_id = ...) instead of pulling
-    // every cached article's full content over the wire just to filter by
-    // feedId in JS — see the comment on cacheDeleteByFeedId for the
-    // production timeout (and the slow/"crashed-feeling" feed-settings
-    // save) this previously caused.
-    await db.cacheDeleteByFeedId(req.params.id);
+  // Changing the URL invalidates any cached content fetched under the old
+  // one — without this, the reader would keep showing old-feed content
+  // (or errors from it) until the cache TTL happens to expire on its own.
+  if (url !== undefined) await articleCache.delete(feed.url);
+  // Bust the article cache when block rules change — see the matching
+  // comment in src/main/index.js's feeds:updateRules handler for why this
+  // matters (otherwise the element picker's verification step checks
+  // stale, pre-rule cached content and always reports a false negative).
+  if (cssSelectors !== undefined || htmlPatterns !== undefined) {
+    const feedId = req.params.id;
+    for (const [cacheUrl, entry] of await articleCache.entries()) {
+      if (entry.feedId === feedId) await articleCache.delete(cacheUrl);
+    }
   }
   res.json(feedRow(feed));
 });
@@ -864,23 +549,15 @@ app.delete('/api/feeds/:id', async (req, res) => {
 });
 
 // ─── Feed fetching ────────────────────────────────────────────────────────────
-// force:true (sent by the explicit Refresh button, pull-to-refresh, and the
-// auto-refresh timer) bypasses the feed cache so those actions always hit
-// the network. Plain page-load/mount refreshes don't set it, so a reload
-// moments after the last one is served from cache instead of re-fetching
-// every single feed's XML from its origin again.
 app.post('/api/feeds/fetch-all', async (req, res) => {
-  const force = !!req.body?.force;
-  const [feedsRaw, folders] = await Promise.all([db.listFeeds(req.userId), db.listFolders(req.userId)]);
-  const folderById = Object.fromEntries(folders.map(f => [f.id, f]));
-  const feeds = feedsRaw.map(f => resolveFeedRules(feedRow(f), f.folder ? folderById[f.folder] : null, null));
+  const feeds = (await db.listFeeds(req.userId)).map(feedRow);
   const CONCURRENCY = 6;
   const results = new Array(feeds.length);
   let next = 0;
   await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
     while (next < feeds.length) {
       const i = next++;
-      try { results[i] = { ok: true, ...await fetchFeedCached(req.userId, feeds[i], userCookieJars(req.userId), force) }; }
+      try { results[i] = { ok: true, ...await fetchFeed(feeds[i], cookieJars) }; }
       catch (e) { results[i] = { ok: false, feedId: feeds[i].id, error: e.message }; }
     }
   }));
@@ -889,8 +566,7 @@ app.post('/api/feeds/fetch-all', async (req, res) => {
 app.post('/api/feeds/:id/fetch', async (req, res) => {
   const feed = await db.findFeed(req.userId, req.params.id);
   if (!feed) return res.status(404).json({ error: 'Not found' });
-  const folder = feed.folder ? await db.findFolder(req.userId, feed.folder) : null;
-  try { res.json({ ok: true, ...await fetchFeedCached(req.userId, resolveFeedRules(feedRow(feed), folder, null), userCookieJars(req.userId), !!req.body?.force) }); }
+  try { res.json({ ok: true, ...await fetchFeed(feedRow(feed), cookieJars) }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
@@ -898,35 +574,20 @@ app.post('/api/feeds/:id/fetch', async (req, res) => {
 app.post('/api/article/fetch', async (req, res) => {
   const { url, feedId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
-  // This was previously missing entirely — every other endpoint that
-  // fetches a URL on the server's behalf (resolve, add-feed, the proxy)
-  // checks it, but this one, the single highest-traffic one, didn't.
-  // article.link comes from parsed feed content, not something the user
-  // directly typed — a malicious or compromised feed could set an
-  // article's <link> to an internal address (a cloud metadata endpoint,
-  // an internal service, localhost) and have this server fetch it and
-  // hand the response back as "article content."
-  let hostname;
-  try { hostname = new URL(url).hostname; }
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  const ssrfError = await checkSsrfSafe(hostname);
-  if (ssrfError) return res.status(400).json({ error: ssrfError });
 
-  const cacheKey = articleContentCacheKey(url);
-
-  // These two are independent reads — previously sequential (ttl, then
-  // cache), meaning every single article open paid for two round-trips
-  // back-to-back before any actual work started. articleTtlMs also now
-  // goes through getSettingsCached rather than hitting Supabase directly.
-  const [ttl, cached] = await Promise.all([articleTtlMs(req.userId), articleCache.get(cacheKey)]);
+  const ttl = await articleTtlMs(req.userId);
+  const cached = await articleCache.get(url);
   if (cached && Date.now() - cached.ts < ttl) return res.json(cached.result);
 
   const feed = feedId ? await db.findFeed(req.userId, feedId) : null;
-  const folder = feed?.folder ? await db.findFolder(req.userId, feed.folder) : null;
-  const feedRowData = feed ? resolveFeedRules(feedRow(feed), folder, await getSettingsCached(req.userId)) : null;
+  const feedRowData = feed ? feedRow(feed) : null;
+  if (feedRowData && !feedRowData.fetchStrategyOrder?.length) {
+    const globalOrder = (await db.getSettings(req.userId)).fetchStrategyOrder;
+    if (globalOrder?.length) feedRowData.fetchStrategyOrder = globalOrder;
+  }
   try {
-    const result = await fetchArticle(url, feedRowData, userCookieJars(req.userId), rssFallback);
-    await articleCache.set(cacheKey, { ts: Date.now(), feedId: feedId || null, result });
+    const result = await fetchArticle(url, feedRowData, cookieJars, rssFallback);
+    await articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
     res.json(result);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -934,58 +595,19 @@ app.post('/api/article/fetch', async (req, res) => {
 app.post('/api/article/clear-cache', async (req, res) => {
   const { url } = req.body || {};
   if (url) {
-    await articleCache.delete(articleContentCacheKey(url));
+    await articleCache.delete(url);
   } else {
-    await db.cacheClearAll();
+    for (const [key] of await articleCache.entries()) await articleCache.delete(key);
   }
   res.json({ ok: true });
 });
 
 // ─── Article state ────────────────────────────────────────────────────────────
 app.get('/api/articles/state', async (req, res) => res.json(await db.getArticleState(req.userId)));
-
-// Combined initial-load endpoint — the client used to make four separate
-// requests (feeds, folders, article state, settings) in parallel via
-// Promise.all on mount. Client-side parallelism doesn't remove the cost of
-// four separate round trips: each one pays its own TLS/connection
-// overhead, passes through the auth middleware independently, and on
-// Vercel specifically each can land on a different concurrent lambda
-// invocation with its own cold-start risk. This does the same four reads
-// server-side (still via Promise.all, so no slower than the slowest
-// individual one) but as a single response — one round trip instead of
-// four is the single biggest lever available for "account data takes a
-// couple seconds to load".
-app.get('/api/bootstrap', async (req, res) => {
-  const [feeds, folders, articleState, settings] = await Promise.all([
-    db.listFeeds(req.userId),
-    db.listFolders(req.userId),
-    db.getArticleState(req.userId),
-    getSettingsCached(req.userId),
-  ]);
-  res.json({
-    feeds: feeds.map(feedRow),
-    folders: folders.map(f => ({ id: f.id, name: f.name, icon: f.icon, thumbnailMode: f.thumbnailMode || null })),
-    articleState,
-    settings,
-  });
-});
-
 app.post('/api/articles/mark-read', async (req, res) => {
-  const { articleId, feedId, read, url } = req.body;
-  const isRead = read !== false;
-  await db.markRead(req.userId, `${feedId}:${articleId}`, isRead);
-  if (isRead && url) {
-    try { await articleCache.delete(articleContentCacheKey(url)); } catch {}
-  }
+  const { articleId, feedId } = req.body;
+  await db.markRead(req.userId, `${feedId}:${articleId}`);
   res.json({ ok: true });
-});
-app.post('/api/articles/mark-read-bulk', async (req, res) => {
-  const items = Array.isArray(req.body?.items) ? req.body.items : [];
-  const keys = items.filter(x => x?.articleId && x?.feedId).map(x => `${x.feedId}:${x.articleId}`);
-  await db.markReadBulk(req.userId, keys);
-  const urls = items.filter(x => x?.url).map(x => articleContentCacheKey(x.url));
-  if (urls.length) { try { await db.cacheDeleteByUrls(urls); } catch {} }
-  res.json({ ok: true, count: keys.length });
 });
 app.post('/api/articles/toggle-star', async (req, res) => {
   const { articleId, feedId, starred } = req.body;
@@ -1009,16 +631,7 @@ app.post('/api/articles/toggle-star', async (req, res) => {
 //     though the static shell renders fine. Routing it back through our own
 //     server makes it same-origin from the browser's perspective, so CORS
 //     no longer applies at all.
-// app.all (not app.get) — a proxied page's own AJAX calls aren't always
-// GET. The injected shim (buildProxyShim below) rewrites fetch()/XHR URLs
-// to point here but preserves the original method/body/headers entirely,
-// so a page's own POST request (search, filtering, any interactive
-// feature backed by an API call) arrives here as a real POST needing to
-// be forwarded as one — previously this only had a GET route, so any
-// non-GET AJAX call 404'd immediately after being correctly rewritten,
-// which likely explains interactive features silently not working on
-// JS-heavy sites even once the shim itself was functioning correctly.
-app.all('/api/proxy', async (req, res) => {
+app.get('/api/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send('Missing url param');
   let parsed;
@@ -1027,31 +640,7 @@ app.all('/api/proxy', async (req, res) => {
   const ssrfError = await checkSsrfSafe(parsed.hostname);
   if (ssrfError) return res.status(400).send(ssrfError);
   try {
-    // Sites that do UA-sniffing serve their (often much more legible in a
-    // narrow iframe) mobile layout when asked for it — the client sets
-    // mobile=1 based on its own responsive layout state (see InlineBrowser
-    // in App.jsx), so the linked page's layout matches whatever Flux
-    // itself is currently using rather than always forcing a desktop
-    // layout into a phone-width frame.
-    const useMobileUA = req.query.mobile === '1';
-    const isBodyMethod = !['GET', 'HEAD'].includes(req.method);
-    // express.json() upstream only parses JSON bodies — a non-JSON POST
-    // (form-encoded, multipart, raw text) would arrive here with
-    // req.body as {} or unparsed, and re-forwarding it correctly isn't
-    // possible without also switching the global body parser to keep raw
-    // bytes for every route. JSON covers the overwhelming majority of
-    // modern API-driven interactive features (search, filters, data
-    // fetches), so this handles that case; other body types pass through
-    // with no body rather than guessing at reconstructing them.
-    const fetchOpts = {
-      headers: useMobileUA ? { 'User-Agent': MOBILE_UA } : {},
-      method: req.method,
-    };
-    if (isBodyMethod && req.body && Object.keys(req.body).length) {
-      fetchOpts.body = JSON.stringify(req.body);
-      fetchOpts.headers = { ...fetchOpts.headers, 'Content-Type': 'application/json' };
-    }
-    const upstream = await fetchWithCookies(target, fetchOpts, userCookieJars(req.userId));
+    const upstream = await fetchWithCookies(target, {}, cookieJars);
     const ct = upstream.headers.get('content-type') || '';
     if (ct.includes('text/html')) {
       let html = await upstream.text();
@@ -1074,23 +663,7 @@ app.all('/api/proxy', async (req, res) => {
         // CSS url(...) in <style> blocks and inline style attributes
         .replace(/url\((["']?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
         .replace(/url\((["']?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
-        // A CSP delivered via <meta http-equiv> (rather than, or in
-        // addition to, the HTTP header already stripped below) is easy to
-        // miss entirely — and unlike the header, it's baked into the HTML
-        // itself so simply removing the response header doesn't touch it.
-        // Left in place, a typical 'self'-based script-src/style-src would
-        // block every one of the site's own scripts and stylesheets: 'self'
-        // resolves against whatever origin is actually serving the
-        // document (Flux's, since that's who's responding to this
-        // request), but the site's own assets just got rewritten to
-        // absolute URLs pointing at ITS real origin above — a mismatch
-        // that reads as a legitimate cross-origin load to the CSP, and
-        // blocks it. That's consistent with both symptoms reported here:
-        // stylesheets failing silently (unstyled/default-white page) and
-        // the site's own JS never executing (hover/click card previews,
-        // or any other interactive feature, simply doing nothing).
-        .replace(/<meta[^>]+http-equiv=(["'])content-security-policy\1[^>]*>/gi, '')
-        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || ''), req.query.mobile === '1'));
+        .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || '')));
       // Strip ALL frame-blocking mechanisms — X-Frame-Options and CSP
       // frame-ancestors both prevent the proxy iframe from rendering.
       res.removeHeader('X-Frame-Options');
@@ -1107,31 +680,19 @@ app.all('/api/proxy', async (req, res) => {
   } catch (e) { res.status(502).send(`Proxy fetch failed: ${e.message}`); }
 });
 
-function buildProxyShim(base, token, mobile) {
-  // JSON.stringify does NOT escape "</script>" — if it appeared inside
-  // base or token, it would prematurely close this <script> tag when
-  // embedded into the HTML response, breaking out of the script context.
-  // Neither value can realistically contain it today (token is a
-  // server-generated hex string; base's host component comes from a URL
-  // that already passed URL parsing and SSRF checks, which don't permit
-  // that character sequence in a hostname) — this is defense-in-depth
-  // against that invariant ever quietly changing, not a fix for a
-  // currently-reachable injection.
-  const safeJson = (v) => JSON.stringify(v).replace(/<\/script/gi, '<\\/script');
+function buildProxyShim(base, token) {
   // Runs before any of the page's own <script> tags. Rewrites same-page
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
-    var BASE=${safeJson(base)};
-    var TOKEN=${safeJson(token || '')};
-    var MOBILE=${mobile ? 'true' : 'false'};
+    var BASE=${JSON.stringify(base)};
+    var TOKEN=${JSON.stringify(token || '')};
     function toProxied(u){
       try{
         var abs=new URL(u, document.baseURI).href;
         if (abs.indexOf(location.origin+'/api/proxy')===0) return u; // already proxied
         var proxied='/api/proxy?url='+encodeURIComponent(abs);
         if (TOKEN) proxied += '&token='+encodeURIComponent(TOKEN);
-        if (MOBILE) proxied += '&mobile=1';
         return proxied;
       }catch(e){ return u; }
     }
@@ -1148,19 +709,6 @@ function buildProxyShim(base, token, mobile) {
       try{ arguments[1]=toProxied(url); }catch(e){}
       return oo.apply(this, arguments);
     };
-    // Every link on the framed page should exit to the user's real browser
-    // instead of navigating around inside this iframe — capture-phase so
-    // this runs before the page's own click handlers, and stopPropagation
-    // so the page never sees the click and can't act on it itself.
-    document.addEventListener('click', function(e){
-      var a = e.target && e.target.closest && e.target.closest('a[href]');
-      if (!a) return;
-      var href = a.getAttribute('href') || '';
-      if (!href || href.charAt(0)==='#' || href.indexOf('javascript:')===0) return;
-      var abs; try { abs = new URL(href, document.baseURI).href; } catch(e){ return; }
-      e.preventDefault(); e.stopPropagation();
-      try { window.parent.postMessage({ type:'flux-proxy-link-click', url: abs }, '*'); } catch(e){}
-    }, true);
   })();</script>`;
 }
 
@@ -1196,7 +744,7 @@ app.post('/api/opml/import', upload.single('file'), async (req, res) => {
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 app.get('/api/settings', async (req, res) => res.json(await db.getSettings(req.userId)));
-app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); invalidateSettingsCache(req.userId); res.json({ ok: true }); });
+app.put('/api/settings', async (req, res) => { await db.setSettings(req.userId, req.body || {}); res.json({ ok: true }); });
 
 // ─── Ollama ───────────────────────────────────────────────────────────────────
 // The Electron app starts/stops Ollama from its main process via child_process.
@@ -1348,21 +896,6 @@ app.use((req, res, next) => {
     console.log(`${color}${res.statusCode}\x1b[0m ${req.method} ${req.path} \x1b[2m(${ms}ms)\x1b[0m`);
   });
   next();
-});
-
-// Global error handler — must be registered after every route (Express
-// dispatches to error-handling middleware, identified by its 4-argument
-// signature, only after a route calls next(err) or throws in a way
-// express-async-errors forwards). Every route above returns JSON, so
-// errors should too, rather than Express's default HTML stack-trace page
-// — the client's http() helper in api.js expects to be able to call
-// resp.json() on any response, success or failure.
-app.use((err, req, res, next) => {
-  console.error(`[unhandled] ${req.method} ${req.path}:`, err);
-  db.logError({ source: 'server', userId: req.userId, path: `${req.method} ${req.path}`, message: err.message, stack: err.stack })
-    .catch(() => {}); // logError already swallows its own errors; belt-and-suspenders
-  if (res.headersSent) return next(err);
-  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

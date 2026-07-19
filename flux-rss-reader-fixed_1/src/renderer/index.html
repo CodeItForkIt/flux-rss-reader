@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Deliberately the first resource-related tag in <head>: a CSP set via
+      <meta> only applies to things the parser encounters *after* it —
+      anything earlier (the icon link, previously; the font links below,
+      if this were below them) loads outside its coverage purely because
+      of document order, not because it's actually exempt from the
+      policy's intent.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' app:; script-src 'self' app: 'unsafe-inline' https://www.youtube.com https://s.ytimg.com; style-src 'self' app: 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' app: https://fonts.gstatic.com; img-src 'self' app: data: https: http:; connect-src 'self' app: https: http:; frame-src 'self' app: https: http:;">
+    <title>Flux</title>
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <!--
+      Preconnect + a real <link rel="stylesheet"> instead of the
+      @import(...) that used to live in App.jsx's GLOBAL_CSS string (still
+      there for the app's own styles, just not this). That @import only
+      ever reached the browser once React had downloaded, parsed,
+      executed, and committed a <style> tag containing it — meaning font
+      loading didn't even *start* until the entire JS bundle was done,
+      and only then triggered Google Fonts' own two-hop chain (this CSS
+      file, which itself points at the actual font files on
+      fonts.gstatic.com). Every real user's page load was serializing
+      "download+parse+exec JS" and "fetch fonts" instead of doing them in
+      parallel, then reflowing all the page's text once Inter/Lora
+      finally arrived — a very plausible explanation for both a slow LCP
+      (fallback-font text repainting late, in the final font) and a
+      nontrivial CLS score (Inter/Lora have different metrics than the
+      system-ui/Georgia fallbacks, so that repaint moves things).
+      Putting the real tags in <head> lets the browser discover and start
+      this fetch immediately while parsing the HTML, well before it even
+      requests the JS bundle, let alone runs it.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Lora:ital,wght@0,400;0,600;1,400;1,600&display=swap">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.jsx"></script>
+  </body>
+</html>
