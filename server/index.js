@@ -896,7 +896,7 @@ app.post('/api/feeds/:id/fetch', async (req, res) => {
 
 // ─── Article content ──────────────────────────────────────────────────────────
 app.post('/api/article/fetch', async (req, res) => {
-  const { url, feedId, rssFallback } = req.body;
+  const { url, feedId, articleId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
   // This was previously missing entirely — every other endpoint that
   // fetches a URL on the server's behalf (resolve, add-feed, the proxy)
@@ -926,7 +926,18 @@ app.post('/api/article/fetch', async (req, res) => {
   const feedRowData = feed ? resolveFeedRules(feedRow(feed), folder, await getSettingsCached(req.userId)) : null;
   try {
     const result = await fetchArticle(url, feedRowData, userCookieJars(req.userId), rssFallback);
-    await articleCache.set(cacheKey, { ts: Date.now(), feedId: feedId || null, result });
+    // Re-check right before writing, not at the top of the request: this
+    // is specifically about whether the article became read WHILE this
+    // fetch (content download + Readability extraction — not instant)
+    // was in flight, most relevant for prefetchArticleContent's
+    // background requests racing against a fast mark-read for the same
+    // article. Checking earlier wouldn't catch that; checking now does,
+    // without changing anything about the normal case (open, read, mark
+    // read afterward — always "not yet read" here, since marking read
+    // necessarily happens after this fetch that's checking).
+    const stateKey = (feedId && articleId) ? `${feedId}:${articleId}` : null;
+    const nowRead = stateKey ? await db.isArticleRead(req.userId, stateKey) : false;
+    if (!nowRead) await articleCache.set(cacheKey, { ts: Date.now(), feedId: feedId || null, result });
     res.json(result);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -1089,6 +1100,23 @@ app.all('/api/proxy', async (req, res) => {
         // stylesheets failing silently (unstyled/default-white page) and
         // the site's own JS never executing (hover/click card previews,
         // or any other interactive feature, simply doing nothing).
+        // Next.js (and most modern bundlers) commonly add crossorigin=
+        // "anonymous" + integrity="sha256-..." to <script>/<link> tags for
+        // Subresource Integrity. Once the src/href above gets rewritten to
+        // an absolute URL on the REAL origin, while this document itself
+        // is served from Flux's own origin, the crossorigin attribute
+        // forces the browser into CORS mode for what it now sees as a
+        // cross-origin request — which the real site's server almost
+        // certainly doesn't grant CORS for (it was never built to be
+        // embedded), silently blocking the resource entirely. A plain
+        // <script src="https://other-origin/x.js"> with no crossorigin
+        // attribute has no CORS requirement at all and just loads; this
+        // is what actually gets that classic, universally-working case to
+        // apply here. Very plausibly the deciding factor for whether a
+        // Next.js site's own JS ever executes at all (hover/click
+        // previews, or any client-side interactivity) through this proxy.
+        .replace(/\s+crossorigin(=("|')[^"']*\2)?/gi, '')
+        .replace(/\s+integrity=("|')[^"']*\1/gi, '')
         .replace(/<meta[^>]+http-equiv=(["'])content-security-policy\1[^>]*>/gi, '')
         .replace(/<head([^>]*)>/i, `<head$1><base href="${base}/">` + buildProxyShim(base, String(req.query.token || ''), req.query.mobile === '1'));
       // Strip ALL frame-blocking mechanisms — X-Frame-Options and CSP

@@ -593,7 +593,7 @@ app.post('/api/feeds/:id/fetch', async (req, res) => {
 
 // ─── Article content ──────────────────────────────────────────────────────────
 app.post('/api/article/fetch', async (req, res) => {
-  const { url, feedId, rssFallback } = req.body;
+  const { url, feedId, articleId, rssFallback } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
 
   const ttl = await articleTtlMs(req.userId);
@@ -608,7 +608,12 @@ app.post('/api/article/fetch', async (req, res) => {
   }
   try {
     const result = await fetchArticle(url, feedRowData, userCookieJars(req.userId), rssFallback);
-    await articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
+    // See the matching comment in server/index.js — re-checked right
+    // before writing, not at the top, so a fast mark-read racing a slow
+    // prefetch for the same article is caught.
+    const stateKey = (feedId && articleId) ? `${feedId}:${articleId}` : null;
+    const nowRead = stateKey ? await db.isArticleRead(req.userId, stateKey) : false;
+    if (!nowRead) await articleCache.set(url, { ts: Date.now(), feedId: feedId || null, result });
     res.json(result);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -688,7 +693,15 @@ app.get('/api/proxy', async (req, res) => {
         .replace(/url\((["']?)\/(?!\/)([^)"']*)\1\)/gi, `url($1${base}/$2$1)`)
         .replace(/url\((["']?)\/\/([^)"']*)\1\)/gi, `url($1${parsed.protocol}//$2$1)`)
         // See the matching comment in server/index.js's /api/proxy route:
-        // a CSP delivered via <meta http-equiv> is otherwise missed
+        // crossorigin/integrity attributes force CORS mode on what the
+        // browser now sees as a cross-origin script/link load once its
+        // src/href is rewritten to the real origin — almost certainly not
+        // granted by a site never built to be embedded, silently blocking
+        // the resource. A plain src/href with neither attribute has no
+        // CORS requirement and just loads.
+        .replace(/\s+crossorigin(=("|')[^"']*\2)?/gi, '')
+        .replace(/\s+integrity=("|')[^"']*\1/gi, '')
+        // A CSP delivered via <meta http-equiv> is otherwise missed
         // entirely by the header-stripping below, and a typical
         // 'self'-based script-src/style-src blocks every one of the
         // site's own rewritten (now-absolute, real-origin) assets once

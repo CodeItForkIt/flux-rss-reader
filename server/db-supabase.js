@@ -311,6 +311,21 @@ class SupabaseStore {
     const { error } = await this.sb.from('article_state').upsert({ key, user_id: userId, is_read: read }, { onConflict: 'key,user_id' });
     this._throw(error, 'markRead');
   }
+  // A single targeted lookup (WHERE key = ... AND user_id = ..., hitting
+  // the primary-key index) — used right before writing an article's
+  // content to cache, to check whether it was marked read WHILE this
+  // fetch was in flight (a prefetch and a fast mark-read racing against
+  // each other). Deliberately NOT getArticleState(userId): that paginates
+  // through this user's entire read/starred history just to answer one
+  // yes/no question. This does not change caching for the normal case —
+  // opening an article, reading it, and marking it read afterward always
+  // finds "not yet read" here, since marking read necessarily happens
+  // after the fetch that's checking.
+  async isArticleRead(userId, key) {
+    const { data, error } = await this.sb.from('article_state').select('is_read').eq('user_id', userId).eq('key', key).maybeSingle();
+    this._throw(error, 'isArticleRead');
+    return !!data?.is_read;
+  }
   // Bulk variant for "mark all read" — previously the client fired one
   // HTTP request + one upsert per article (potentially hundreds at once
   // for a big unread pile). Besides being slow, a burst that size has a

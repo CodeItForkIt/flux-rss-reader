@@ -273,6 +273,10 @@ class JSONStore {
     row.isRead = read;
     this._save();
   }
+  // See the matching comment in db-supabase.js.
+  isArticleRead(userId, key) {
+    return !!this.data.articleState.find(r => r.userId === userId && r.key === key)?.isRead;
+  }
   // Bulk variant for "mark all read" — see the matching comment in
   // db-supabase.js. Here the main win is calling _save() once instead of
   // once per article (that's a full JSON.stringify + file write each

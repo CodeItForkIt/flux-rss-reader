@@ -5,6 +5,7 @@
  * Used by both the Electron main process and the Express server.
  * All deps are ESM-only so we lazy-import them.
  */
+const dns = require('dns').promises;
 
 let _Parser, _Readability, _JSDOM, _cheerio, _fetch, _CookieJar, _createDOMPurify, _purifyWindow;
 
@@ -23,6 +24,46 @@ async function loadDeps() {
   const dp     = await import('dompurify');
   _createDOMPurify = dp.default;
   _purifyWindow = new _JSDOM('').window; // DOMPurify needs a DOM window to sanitize against
+}
+
+// server/index.js and src/main/index.js each keep their own copy of this
+// same check, used to validate a URL up front (adding a feed, the initial
+// /api/proxy request) before anything here ever runs. This copy exists for
+// a different, necessary reason: fetchWithCookies below follows redirects
+// (feeds and article links routinely redirect at least once), and a
+// destination that passed the up-front check can still redirect to
+// 169.254.169.254 or localhost on ITS OWN server's say-so — the up-front
+// check has no way to see that coming, since it only ever looked at the
+// URL the request started with. This runs again before every hop.
+function isPrivateOrReservedIp(ip) {
+  ip = ip.replace(/^::ffff:/i, ''); // IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254)
+  if (ip.includes(':')) { // IPv6
+    const low = ip.toLowerCase();
+    return low === '::1' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80') || low === '::';
+  }
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return true; // malformed — fail closed
+  const [a, b] = parts;
+  if (a === 127) return true;                          // loopback
+  if (a === 10) return true;                            // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12
+  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
+  if (a === 169 && b === 254) return true;               // link-local incl. cloud metadata (169.254.169.254)
+  if (a === 0) return true;
+  return false;
+}
+async function checkSsrfSafe(hostname) {
+  try {
+    const records = await dns.lookup(hostname, { all: true });
+    for (const r of records) {
+      if (isPrivateOrReservedIp(r.address)) {
+        return `Refusing to fetch ${hostname} — resolves to a private/internal address.`;
+      }
+    }
+    return null; // safe
+  } catch {
+    return `Could not resolve ${hostname}.`;
+  }
 }
 
 // Every piece of HTML that ends up in the client's dangerouslySetInnerHTML
@@ -63,51 +104,79 @@ const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleW
 
 async function fetchWithCookies(url, opts = {}, cookieJars) {
   await loadDeps();
-  const domain   = new URL(url).hostname;
-  const jar      = getCookieJar(domain, cookieJars);
 
-  // YouTube/Google can serve a consent/cookie-wall HTML page instead of
-  // the real response (e.g. feeds/videos.xml) when no consent cookie is
-  // present — most reliably reproduced from EU-region IPs, but it isn't
-  // strictly geo-gated, so we always pre-seed this. YT001 is the
-  // long-standing "accept all" sentinel value Google's own consent
-  // banner sets; setting it ourselves skips the interstitial entirely.
-  if (/(^|\.)youtube\.com$|(^|\.)google\.com$/i.test(domain)) {
-    const existing = await jar.getCookieString(url);
-    if (!/(?:^|;\s*)CONSENT=/.test(existing)) {
-      try { await jar.setCookie('CONSENT=YES+; Domain=.youtube.com; Path=/', url); } catch {}
-      try { await jar.setCookie('CONSENT=YES+; Domain=.google.com; Path=/', url); } catch {}
-    }
-  }
-
-  const cookieStr = await jar.getCookieString(url);
-
-  const headers = {
-    'User-Agent':      UA,
-    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control':   'no-cache',
-    ...(cookieStr ? { Cookie: cookieStr } : {}),
-    ...(opts.headers || {}),
-  };
-
-  // 15s timeout — a single hung connection shouldn't block the whole
-  // parallel feed fetch, leaving "Fetching feeds…" spinner forever.
+  const maxRedirects = 10;
+  // One deadline for the whole chain, not reset on every hop -- otherwise a
+  // malicious server could extend the effective timeout arbitrarily by
+  // stringing along redirects, each resetting a fresh per-hop clock.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs || 15000);
-  let resp;
+
   try {
-    resp = await _fetch(url, { ...opts, headers, redirect: 'follow', signal: controller.signal });
+    let currentUrl = url;
+    let method = opts.method || 'GET';
+    let body = opts.body;
+
+    for (let hop = 0; ; hop++) {
+      if (hop > maxRedirects) throw new Error(`Too many redirects (>${maxRedirects})`);
+
+      const hostname = new URL(currentUrl).hostname;
+      const ssrfError = await checkSsrfSafe(hostname);
+      if (ssrfError) throw new Error(hop === 0 ? ssrfError : `Blocked redirect: ${ssrfError}`);
+
+      const domain = hostname;
+      const jar = getCookieJar(domain, cookieJars);
+
+      // YouTube/Google can serve a consent/cookie-wall HTML page instead of
+      // the real response (e.g. feeds/videos.xml) when no consent cookie is
+      // present — most reliably reproduced from EU-region IPs, but it isn't
+      // strictly geo-gated, so we always pre-seed this. YT001 is the
+      // long-standing "accept all" sentinel value Google's own consent
+      // banner sets; setting it ourselves skips the interstitial entirely.
+      if (/(^|\.)youtube\.com$|(^|\.)google\.com$/i.test(domain)) {
+        const existing = await jar.getCookieString(currentUrl);
+        if (!/(?:^|;\s*)CONSENT=/.test(existing)) {
+          try { await jar.setCookie('CONSENT=YES+; Domain=.youtube.com; Path=/', currentUrl); } catch {}
+          try { await jar.setCookie('CONSENT=YES+; Domain=.google.com; Path=/', currentUrl); } catch {}
+        }
+      }
+
+      const cookieStr = await jar.getCookieString(currentUrl);
+      const headers = {
+        'User-Agent':      UA,
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control':   'no-cache',
+        ...(cookieStr ? { Cookie: cookieStr } : {}),
+        ...(opts.headers || {}),
+      };
+
+      const resp = await _fetch(currentUrl, { ...opts, method, body, headers, redirect: 'manual', signal: controller.signal });
+
+      // Persist Set-Cookie from THIS hop — a redirect response can set
+      // cookies too (login flows routinely do), not just the final one.
+      const raw = resp.headers.raw?.()?.['set-cookie'] || [];
+      for (const c of raw) {
+        try { await jar.setCookie(c, currentUrl); } catch {}
+      }
+
+      const isRedirect = resp.status >= 300 && resp.status < 400 && resp.headers.get('location');
+      if (!isRedirect) return resp;
+
+      currentUrl = new URL(resp.headers.get('location'), currentUrl).href;
+      // Standard redirect semantics: 303 always downgrades to a bodyless
+      // GET; 301/302 do the same ONLY for a non-GET/HEAD original request
+      // (long-standing de-facto behavior nearly every HTTP client
+      // replicates, node-fetch's own 'follow' mode included); 307/308
+      // preserve the original method and body exactly.
+      if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && !['GET', 'HEAD'].includes(method))) {
+        method = 'GET';
+        body = undefined;
+      }
+    }
   } finally {
     clearTimeout(timer);
   }
-
-  // Persist Set-Cookie
-  const raw = resp.headers.raw?.()?.['set-cookie'] || [];
-  for (const c of raw) {
-    try { await jar.setCookie(c, url); } catch {}
-  }
-  return resp;
 }
 
 // Bare _fetch() calls (archive.ph and googlebot-ua below) previously had NO
@@ -1201,5 +1270,6 @@ module.exports = {
   applyBlockRules, extractReadable, fetchFeed, fetchFeedAvatar, fetchYoutubeVideoDuration,
   buildOpml, parseOpml, ollamaCluster, ollamaSummarize, ollamaDailyDigest,
   getCookieJar, resolveFeedUrl, sanitizeArticleHtml, MOBILE_UA,
+  checkSsrfSafe, isPrivateOrReservedIp,
   FETCH_STRATEGY_NAMES: DEFAULT_STRATEGY_ORDER,
 };

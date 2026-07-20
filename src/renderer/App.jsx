@@ -667,7 +667,7 @@ async function prefetchArticleContent(articles, limit = 12, concurrency = 3) {
     while (i < targets.length) {
       const a = targets[i++];
       try {
-        await api.articles.fetch({ url: a.link, feedId: a.feedId, rssFallback: { title: a.title, summary: a.summary, content: a.rssContent || null } });
+        await api.articles.fetch({ url: a.link, feedId: a.feedId, articleId: a.id, rssFallback: { title: a.title, summary: a.summary, content: a.rssContent || null } });
       } catch {} // best-effort — see comment above
     }
   };
@@ -1043,7 +1043,7 @@ function InlineBrowser({ url, onClose, onNavigateArticle, isMobile, trustedDomai
               // the system browser instead, so the iframe never needs
               // permission to navigate the top-level page, trusted or not.
               sandbox={`allow-scripts allow-forms allow-popups allow-pointer-lock${isTrusted ? ' allow-same-origin' : ''}`}
-              style={{ flex:1, border:'none', background:'#fff' }}
+              style={{ flex:1, border:'none', background:T.bg }}
               title="Inline browser"
             />
           ) : (
@@ -1166,6 +1166,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     api.articles.fetch({
       url:         art.link,
       feedId:      art.feedId,
+      articleId:   art.id,
       rssFallback: { title: art.title, summary: art.summary, content: art.rssContent || null },
     })
       .then(r=>{ setContent(r); setLoading(false); })
@@ -1490,7 +1491,7 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     // Re-fetch content with new rules
     if (article&&!article.isYoutube) {
       setContent(null); setLoading(true);
-      api.articles.fetch({url:article.link,feedId:article.feedId}).then(r=>{
+      api.articles.fetch({url:article.link,feedId:article.feedId,articleId:article.id}).then(r=>{
         setContent(r); setLoading(false);
         // Sanity check: did the rule actually remove anything? If the
         // selector still matches the freshly-fetched content, the rule
@@ -3792,13 +3793,16 @@ export default function App() {
   useEffect(()=>{
     if (authState !== 'ok') return;
     api.bootstrap()
-      .then(({ feeds: f, folders: fo, articleState: state, settings: s })=>{
+      .then(async ({ feeds: f, folders: fo, settings: s })=>{
         setFeeds(f); setFolders(fo);
         const merged = { aiClusteringEnabled:false, sponsorBlockEnabled:true, ollamaAutoStart:false, ollamaUrl:'', ollamaModel:'', ...(s||{}) };
         setSettings(merged);
         saveCache({ feeds: f, folders: fo, settings: merged });
         setBootstrapping(false);
-        if(f.length>0) refreshFeeds(f,state,merged);
+        if (f.length>0) {
+          const state = await api.articles.getState();
+          refreshFeeds(f,state,merged);
+        }
       })
       .catch((e)=>{ console.error('[flux] bootstrap failed:', e); setBootstrapping(false); });
   },[authState]);
