@@ -1176,19 +1176,35 @@ function buildProxyShim(base, token, mobile) {
       try{ arguments[1]=toProxied(url); }catch(e){}
       return oo.apply(this, arguments);
     };
-    // Every link on the framed page should exit to the user's real browser
-    // instead of navigating around inside this iframe — capture-phase so
-    // this runs before the page's own click handlers, and stopPropagation
-    // so the page never sees the click and can't act on it itself.
+    // Every unhandled link on the framed page should exit to the user's
+    // real browser instead of navigating around inside this iframe.
+    // Deliberately bubble-phase, not capture, and gated on
+    // e.defaultPrevented: modern sites very commonly render an <a href>
+    // for something that isn't a real page navigation at all -- SPA
+    // client-side routing (Next.js's own Link component included), a
+    // card-hover-preview trigger, a tab switcher, any JS-driven control
+    // that happens to be an anchor tag for styling/semantics -- and
+    // handle the click themselves by calling preventDefault(). Element-
+    // level handlers like those always run before a listener attached to
+    // document, regardless of which script registered first (bubble
+    // order follows DOM tree structure, target-to-root, not registration
+    // order) -- so by the time this fires, e.defaultPrevented correctly
+    // reflects whether the page already dealt with the click. Only step
+    // in for a click nothing else handled, which is what a genuine,
+    // unhandled navigational link looks like. The previous capture-phase
+    // + stopPropagation version ran BEFORE any of that had a chance to
+    // happen at all, hijacking every anchor-tag click site-wide into an
+    // external-browser redirect regardless of what it was actually for.
     document.addEventListener('click', function(e){
+      if (e.defaultPrevented) return;
       var a = e.target && e.target.closest && e.target.closest('a[href]');
       if (!a) return;
       var href = a.getAttribute('href') || '';
       if (!href || href.charAt(0)==='#' || href.indexOf('javascript:')===0) return;
       var abs; try { abs = new URL(href, document.baseURI).href; } catch(e){ return; }
-      e.preventDefault(); e.stopPropagation();
+      e.preventDefault();
       try { window.parent.postMessage({ type:'flux-proxy-link-click', url: abs }, '*'); } catch(e){}
-    }, true);
+    }, false);
   })();</script>`;
 }
 
