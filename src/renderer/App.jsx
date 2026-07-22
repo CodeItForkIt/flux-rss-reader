@@ -1102,7 +1102,9 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     if (article.isYoutube) return;
 
     // If feed uses inline browser, show that by default
-    if (feed?.inlineBrowser) { setInlineBrow(true); setBrowUrl(article.link); return; }
+    if (feed?.inlineBrowser) {
+      setInlineBrow(true); setBrowUrl(article.link); return;
+    }
 
     loadArticleContent(article);
   },[article?.id]);
@@ -2132,17 +2134,20 @@ function AddFeedModal({ folders, preselectedFolder, onAdd, onClose }) {
   // single result — this holds which of those the user has checked.
   const [multiChoice,setMultiChoice]=useState(null); // array of feed objects, or null when not in multi-mode
   const [checkedUrls,setCheckedUrls]=useState(new Set());
+  const [openRssUrl,setOpenRssUrl]=useState(null); // server-computed openrss.org URL, or null when not applicable
 
-  const findFeed=async()=>{
-    if(!url.trim()) return;
-    setResolving(true); setError(null); setMultiChoice(null);
+  const findFeed=async(explicitUrl)=>{
+    const target = explicitUrl ?? url;
+    if(!target.trim()) return;
+    setResolving(true); setError(null); setMultiChoice(null); setOpenRssUrl(null);
     try {
-      const r = await api.feeds.resolve(url.trim());
+      const r = await api.feeds.resolve(target.trim());
       if (r.multiple) {
         setMultiChoice(r.feeds);
         setCheckedUrls(new Set([r.feeds[0].feedUrl])); // preselect the first as a sensible default
       } else if (r.noFeedFound) {
-        setError(`Couldn't find a feed on that page.${r.openRssSuggestion ? ' Try pasting a direct feed URL, or use OpenRSS (openrss.org) to generate one for this site.' : ''}`);
+        setError(`Couldn't find a feed on that page.${r.openRssSuggestion ? ' Try pasting a direct feed URL, or generate one with OpenRSS below.' : ''}`);
+        setOpenRssUrl(r.openRssSuggestion || null);
       } else {
         setResolved(r);
         if (r.name && !name.trim()) setName(r.name);
@@ -2151,9 +2156,18 @@ function AddFeedModal({ folders, preselectedFolder, onAdd, onClose }) {
       // Resolution failed — fall back to treating the input as a literal
       // feed URL so power users who already have a direct feed link
       // aren't blocked by a discovery step they didn't need.
-      setResolved({ feedUrl: url.trim(), name: null, isYoutube: false });
+      setResolved({ feedUrl: target.trim(), name: null, isYoutube: false });
       setError(`Couldn't auto-detect a feed (${e.message}) — will try adding this URL directly.`);
     } finally { setResolving(false); }
+  };
+  // Re-runs discovery against the server-computed OpenRSS URL (built from
+  // the original URL's hostname+pathname — see resolveFeedUrl in
+  // fetcher.js), which OpenRSS turns into a normal, directly-fetchable
+  // feed for a site that doesn't expose one of its own.
+  const tryOpenRss = () => {
+    if (!openRssUrl) return;
+    setUrl(openRssUrl);
+    findFeed(openRssUrl);
   };
 
   const submit=async()=>{
@@ -2212,6 +2226,7 @@ function AddFeedModal({ folders, preselectedFolder, onAdd, onClose }) {
       <div><label style={{ fontSize:12, color:T.textMuted, display:'block', marginBottom:5 }}>Folder</label><select value={folder} onChange={e=>setFolder(e.target.value)} style={{ width:'100%' }}><option value="">No folder</option>{folders.map(f=><option key={f.id} value={f.id}>{f.name}</option>)}</select></div>
       <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', fontSize:13 }}><input type="checkbox" checked={inline} onChange={e=>setInline(e.target.checked)} style={{ width:'auto', padding:0 }} />Use inline browser (for sites that block reader mode)</label>
       {error&&<div style={{ fontSize:12, color:(resolved||multiChoice)?T.warning:T.danger }}>{error}</div>}
+      {openRssUrl&&<Btn variant="outline" onClick={tryOpenRss} disabled={resolving}>{resolving?<Spinner size={12}/>:'Try with OpenRSS'}</Btn>}
       <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginTop:4 }}>
         <Btn variant="outline" onClick={onClose}>Cancel</Btn>
         {(resolved || multiChoice)
@@ -2621,7 +2636,7 @@ function SettingsModal({ settings, onSave, onClose }) {
     <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
       {saveError && <div style={{ fontSize:12, color:T.danger, background:'rgba(220,60,60,.08)', border:'1px solid rgba(220,60,60,.25)', borderRadius:6, padding:'8px 10px' }}>{saveError}</div>}
       <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-        <a href="#" onClick={e=>{e.preventDefault();setShowAbout(true);}} style={{ fontSize:11, color:T.textSubtle }}>About Flux</a>
+        <a href="#" onClick={e=>{e.preventDefault();setShowAbout(true);}} style={{ fontSize:13, color:T.accent, textDecoration:'underline' }}>About Flux</a>
         <div style={{ flex:1 }} />
         <Btn variant="outline" onClick={onClose}>Cancel</Btn>
         <Btn variant="primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</Btn>

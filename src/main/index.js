@@ -729,6 +729,23 @@ function buildProxyShim(base, token) {
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
+    // See the matching, longer comment in server/index.js's buildProxyShim.
+    try { window.localStorage; window.sessionStorage; }
+    catch (e) {
+      var fakeStorage = function(){
+        var m = {};
+        return {
+          getItem: function(k){ return Object.prototype.hasOwnProperty.call(m,k) ? m[k] : null; },
+          setItem: function(k,v){ m[k]=String(v); },
+          removeItem: function(k){ delete m[k]; },
+          clear: function(){ m={}; },
+          key: function(i){ return Object.keys(m)[i] || null; },
+          get length(){ return Object.keys(m).length; }
+        };
+      };
+      try { Object.defineProperty(window, 'localStorage', { value: fakeStorage(), configurable: true }); } catch(e2){}
+      try { Object.defineProperty(window, 'sessionStorage', { value: fakeStorage(), configurable: true }); } catch(e2){}
+    }
     var BASE=${JSON.stringify(base)};
     var TOKEN=${JSON.stringify(token || '')};
     function toProxied(u){

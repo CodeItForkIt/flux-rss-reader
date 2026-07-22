@@ -1150,6 +1150,38 @@ function buildProxyShim(base, token, mobile) {
   // fetch()/XHR calls to go through /api/proxy so they're same-origin (no
   // CORS) and share the same server-side cookie jar as the initial load.
   return `<script>(function(){
+    // Sandboxed iframes without allow-same-origin (the default for any
+    // domain the user hasn't explicitly trusted via the toolbar lock
+    // icon) don't give window.localStorage/sessionStorage an empty store
+    // -- reading the property AT ALL throws a SecurityError synchronously.
+    // Confirmed directly from a user's browser console:
+    // "Uncaught SecurityError: Failed to read the 'localStorage' property
+    // from 'Window': The document is sandboxed and lacks the
+    // 'allow-same-origin' flag." Any page whose own JS touches storage
+    // during initialization -- theme detection, feature flags, session
+    // state, all extremely common -- crashes outright before its own
+    // interactive behavior (click handlers, hover previews, anything)
+    // ever gets set up, which independently explains "clicking does
+    // nothing" on top of whatever the click-shim itself does.
+    // Feature-detected, not domain-detected: only replaces storage if
+    // touching it actually throws (an untrusted domain); a trusted
+    // domain's real, persistent storage is left completely alone.
+    try { window.localStorage; window.sessionStorage; }
+    catch (e) {
+      var fakeStorage = function(){
+        var m = {};
+        return {
+          getItem: function(k){ return Object.prototype.hasOwnProperty.call(m,k) ? m[k] : null; },
+          setItem: function(k,v){ m[k]=String(v); },
+          removeItem: function(k){ delete m[k]; },
+          clear: function(){ m={}; },
+          key: function(i){ return Object.keys(m)[i] || null; },
+          get length(){ return Object.keys(m).length; }
+        };
+      };
+      try { Object.defineProperty(window, 'localStorage', { value: fakeStorage(), configurable: true }); } catch(e2){}
+      try { Object.defineProperty(window, 'sessionStorage', { value: fakeStorage(), configurable: true }); } catch(e2){}
+    }
     var BASE=${safeJson(base)};
     var TOKEN=${safeJson(token || '')};
     var MOBILE=${mobile ? 'true' : 'false'};
