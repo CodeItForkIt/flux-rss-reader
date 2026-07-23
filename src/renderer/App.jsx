@@ -1132,30 +1132,51 @@ function ReaderPane({ article, feed, allArticles, allFeeds, onNavigate, onMarkRe
     return () => { if (!suppressAutoMarkRef.current) onMarkRead(id, feedId, true, link); };
   },[article?.id, onMarkRead]);
 
-  // Closing the tab/window skips the cleanup above in some browsers (the
-  // page can be torn down before a fire-and-forget effect cleanup's async
-  // work is scheduled). `pagehide` fires reliably in that case, and
-  // sendBeacon queues the request to survive the page unloading — it
-  // rides on the session cookie (set alongside the bearer token at
-  // login/register) since sendBeacon can't set an Authorization header.
-  // Only applies to the plain web build. Electron's local IPC mode has no
-  // HTTP endpoint for this to hit, and Electron's *remote* HTTP mode would
-  // need an absolute base URL (not just this relative path) — both rely on
-  // the ordinary cleanup-based mark-read above instead, which is already
-  // correct there; this is purely an extra safety net for the tab-close
-  // case, which is specifically a web-tab concept.
+  // Closing the tab/window, or a straightforward page refresh right after
+  // reading something, can tear the page down before the cleanup effect's
+  // fetch() above ever reaches the server -- worse than just "cancelled
+  // client-side," a request that hasn't been sent yet when the connection
+  // closes may never even start being processed by a serverless function,
+  // meaning the write never happens at all, not just late. sendBeacon
+  // queues its request to survive exactly that. Two things this needs to
+  // get right, both previously missing: the payload has to carry the same
+  // fields the normal path does (url — without it the cache-purge below
+  // silently never runs for this path, since the mark-read route treats a
+  // missing url as "don't bother purging"), and pagehide alone isn't a
+  // reliable enough signal to hang this on — it's known to not fire
+  // consistently across browsers and navigation types. visibilitychange
+  // to 'hidden' is the standard, more reliable trigger recommended
+  // specifically for this beacon-flush pattern (this is what web.dev's
+  // own guidance on the subject recommends over pagehide/unload), so it's
+  // added here as a second, independent trigger for the same flush — not
+  // a replacement, since pagehide catches a couple of cases
+  // visibilitychange doesn't (some in-app navigations that don't change
+  // visibility at all). It rides on the session cookie (set alongside the
+  // bearer token at login/register) since sendBeacon can't set an
+  // Authorization header. Only applies to the plain web build. Electron's
+  // local IPC mode has no HTTP endpoint for this to hit, and Electron's
+  // *remote* HTTP mode would need an absolute base URL (not just this
+  // relative path) — both rely on the ordinary cleanup-based mark-read
+  // above instead, which is already correct there; this is purely an
+  // extra safety net for the tab-close/refresh case, which is
+  // specifically a web-tab concept.
   useEffect(()=>{
     if (api.isElectron) return;
     if (!article || article.isGroup || article.isYoutube) return;
     const flush = () => {
       try {
         navigator.sendBeacon?.('/api/articles/mark-read',
-          new Blob([JSON.stringify({ articleId: article.id, feedId: article.feedId })], { type: 'application/json' }));
+          new Blob([JSON.stringify({ articleId: article.id, feedId: article.feedId, read: true, url: article.link })], { type: 'application/json' }));
       } catch {}
     };
+    const onVisibilityHidden = () => { if (document.visibilityState === 'hidden') flush(); };
     window.addEventListener('pagehide', flush);
-    return () => window.removeEventListener('pagehide', flush);
-  },[article?.id, article?.feedId]);
+    document.addEventListener('visibilitychange', onVisibilityHidden);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onVisibilityHidden);
+    };
+  },[article?.id, article?.feedId, article?.link]);
 
   // Pulled out of the effect above so the manual inline-browser toggle can
   // also trigger it. Previously, switching a feed's default to inline
@@ -3839,25 +3860,60 @@ export default function App() {
     const mins = settings.refreshIntervalMinutes ?? 30;
     if (!mins || mins < 1 || feeds_.length === 0) return;
     autoRefreshRef.current = setInterval(async ()=>{
-      // Diffing by ID set rather than array length — length delta breaks
-      // in two common, opposite ways: (1) a feed that only keeps its last
-      // N items rolling old ones off the same moment new ones arrive nets
-      // to zero length change even with several genuinely new articles
-      // (undercounts, sometimes to exactly zero); (2) a feed recovering
-      // from a previous transient fetch failure suddenly contributes all
-      // its items at once, none of which are actually new (overcounts).
-      // Comparing which IDs are new is correct regardless of what else
-      // simultaneously changed in feed contents.
-      const prevIds = new Set(articlesRef.current.map(a=>a.id));
-      const state = await api.articles.getState();
-      await refreshFeeds(feedsRef.current, state, undefined, true);
-      setArticles(curr => {
-        const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
-        if (newCount > 0) setNewArticleCount(n => n + newCount);
-        return curr;
-      });
+      try {
+        // Diffing by ID set rather than array length — length delta breaks
+        // in two common, opposite ways: (1) a feed that only keeps its last
+        // N items rolling old ones off the same moment new ones arrive nets
+        // to zero length change even with several genuinely new articles
+        // (undercounts, sometimes to exactly zero); (2) a feed recovering
+        // from a previous transient fetch failure suddenly contributes all
+        // its items at once, none of which are actually new (overcounts).
+        // Comparing which IDs are new is correct regardless of what else
+        // simultaneously changed in feed contents.
+        const prevIds = new Set(articlesRef.current.map(a=>a.id));
+        const state = await api.articles.getState();
+        await refreshFeeds(feedsRef.current, state, undefined, true);
+        setArticles(curr => {
+          const newCount = curr.filter(a=>!prevIds.has(a.id)).length;
+          if (newCount > 0) setNewArticleCount(n => n + newCount);
+          return curr;
+        });
+      } catch (e) {
+        // A background tick failing outright (not a server error response,
+        // an actual "Failed to fetch" — confirmed via error_logs to recur
+        // for hours at a stretch on a fixed ~15min cadence) is the classic
+        // signature of a backgrounded mobile tab: the browser suspends
+        // network connectivity while it's not in the foreground, so every
+        // tick attempted during that whole window fails the same way.
+        // Letting this throw uncaught wouldn't break anything further
+        // (setInterval keeps ticking regardless), but there was no
+        // recovery for it either — the visibilitychange listener below is
+        // that recovery, so this catch just needs to not leave an
+        // unhandled rejection sitting around for no reason.
+        api.reportClientError(e.message, e.stack, window.location?.pathname, { source: 'auto-refresh-tick' });
+      }
     }, mins * 60 * 1000);
-    return () => clearInterval(autoRefreshRef.current);
+    // Catches up immediately when the tab becomes visible again, rather
+    // than leaving the user looking at however-stale data accumulated
+    // while backgrounded until the next fixed-schedule tick — which,
+    // right after resuming, is exactly when the network is least likely
+    // to have stabilized yet anyway. Debounced against a refresh that
+    // just ran moments ago (e.g. the tab was barely backgrounded at all)
+    // so this doesn't double up with a tick that already succeeded.
+    let lastRun = Date.now();
+    const onVisible = async () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastRun < 60_000) return;
+      lastRun = Date.now();
+      try {
+        const state = await api.articles.getState();
+        await refreshFeeds(feedsRef.current, state, undefined, true);
+      } catch (e) {
+        api.reportClientError(e.message, e.stack, window.location?.pathname, { source: 'auto-refresh-visibilitychange' });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(autoRefreshRef.current); document.removeEventListener('visibilitychange', onVisible); };
   },[settings.refreshIntervalMinutes, feeds_.length]);
 
   const handleAddFeed = async(config)=>{
